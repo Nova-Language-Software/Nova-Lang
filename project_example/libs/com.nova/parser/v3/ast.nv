@@ -1,0 +1,190 @@
+package parserv3
+
+public enum Visibility {
+    PRIVATE,
+    PUBLIC
+}
+
+public enum UnaryOperator {
+    NEGATE,
+    NOT,
+    DEREFERENCE
+}
+
+public enum BinaryOperator {
+    ADD,
+    SUBTRACT,
+    MULTIPLY,
+    DIVIDE,
+    REMAINDER,
+    EQUAL,
+    NOT_EQUAL,
+    LESS,
+    LESS_EQUAL,
+    GREATER,
+    GREATER_EQUAL,
+    AND,
+    OR
+}
+
+public struct Span {
+    line: int
+    column: int
+    end_line: int
+    end_column: int
+}
+
+public struct Program {
+    package_name: string
+    items: Declaration[]
+    span: Span
+}
+
+public enum Type {
+    Named(name: string, span: Span),
+    Pointer(element: *Type, span: Span),
+    Array(element: *Type, span: Span),
+    Map(key: *Type, value: *Type, span: Span)
+}
+
+public enum Declaration {
+    Import(declaration: ImportDecl),
+    Variable(declaration: VarDecl),
+    Function(declaration: FuncDecl),
+    Structure(declaration: StructDecl),
+    Enumeration(declaration: EnumDecl)
+}
+
+public struct ImportDecl {
+    path: string
+    alias: string
+    span: Span
+}
+
+public struct VarDecl {
+    name: string
+    type: Type
+    initializer: *Expr
+    visibility: Visibility
+    span: Span
+}
+
+public struct Parameter {
+    name: string
+    type: Type
+    variadic: bool
+    span: Span
+}
+
+public struct FuncDecl {
+    name: string
+    parameters: Parameter[]
+    return_types: Type[]
+    body: *Stmt
+    visibility: Visibility
+    is_extern: bool
+    is_owned: bool
+    c_name: string
+    library: string
+    span: Span
+}
+
+public struct StructDecl {
+    name: string
+    fields: StructField[]
+    visibility: Visibility
+    span: Span
+}
+
+public struct StructField {
+    name: string
+    type: Type
+    default_value: *Expr
+    span: Span
+}
+
+public struct EnumDecl {
+    name: string
+    variants: EnumVariant[]
+    visibility: Visibility
+    span: Span
+}
+
+public struct EnumVariant {
+    name: string
+    fields: EnumPayloadField[]
+    span: Span
+}
+
+public struct EnumPayloadField {
+    name: string
+    type: Type
+    span: Span
+}
+
+public enum Expr {
+    Name(name: string, span: Span),
+    Integer(value: int, span: Span),
+    Float(value: float, span: Span),
+    String(value: string, span: Span),
+    RawString(value: string, span: Span),
+    Character(value: char, span: Span),
+    Boolean(value: bool, span: Span),
+    Nil(span: Span),
+    Array(elements: Expr[], span: Span),
+    Map(type: Type, entries: MapEntry[], span: Span),
+    Structure(type_name: string, fields: FieldInit[], span: Span),
+    New(type: Type, span: Span),
+    Unary(operator: UnaryOperator, operand: *Expr, span: Span),
+    Binary(operator: BinaryOperator, left: *Expr, right: *Expr, span: Span),
+    Call(callee: *Expr, arguments: Expr[], span: Span),
+    Index(target: *Expr, index: *Expr, span: Span),
+    Field(target: *Expr, name: string, span: Span),
+    TypeAssert(target: *Expr, type: Type, span: Span)
+}
+
+public struct MapEntry {
+    key: Expr
+    value: Expr
+    span: Span
+}
+
+public struct FieldInit {
+    name: string
+    value: Expr
+    span: Span
+}
+
+public enum Stmt {
+    Variable(declaration: VarDecl, span: Span),
+    Block(statements: Stmt[], span: Span),
+    If(condition: Expr, then_branch: *Stmt, else_branch: *Stmt, span: Span),
+    For(initializer: *Stmt, condition: *Expr, increment: *Stmt, body: *Stmt, span: Span),
+    While(condition: Expr, body: *Stmt, span: Span),
+    Match(value: Expr, cases: MatchCase[], span: Span),
+    Return(values: Expr[], span: Span),
+    Break(span: Span),
+    Continue(span: Span),
+    Print(arguments: Expr[], span: Span),
+    Expression(expression: Expr, span: Span),
+    Assignment(target: Expr, value: Expr, span: Span)
+}
+
+public struct MatchCase {
+    enum_type: string
+    variant: string
+    bindings: PatternBinding[]
+    body: *Stmt
+    span: Span
+}
+
+public struct PatternBinding {
+    field_name: string
+    name: string
+    span: Span
+}
+public struct Attribute {
+    name: string
+    value: string
+    span: Span
+}

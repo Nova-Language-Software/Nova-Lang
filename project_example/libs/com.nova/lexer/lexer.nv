@@ -1,0 +1,620 @@
+package lexer
+
+public enum TokenKind {
+    ILLEGAL,
+    EOF,
+    IDENT,
+    INT_LIT,
+    FLOAT_LIT,
+    STRING_LIT,
+    RAW_STRING_LIT,
+    CHAR_LIT,
+    VAR,
+    INT,
+    FLOAT,
+    BOOL,
+    CHAR,
+    STRING,
+    ERROR,
+    TRUE,
+    FALSE,
+    NIL,
+    PRINT,
+    IF,
+    ELSE,
+    WHILE,
+    FOR,
+    MATCH,
+    BREAK,
+    CONTINUE,
+    AND,
+    OR,
+    NOT,
+    FUNC,
+    STRUCT,
+    ENUM,
+    RETURN,
+    VOID,
+    PACKAGE,
+    IMPORT,
+    PUBLIC,
+    AS,
+    FROM,
+    EXTERN,
+    OWNED,
+    PLUS,
+    MINUS,
+    STAR,
+    SLASH,
+    PERCENT,
+    ASSIGN,
+    EQUAL,
+    NOT_EQUAL,
+    LESS,
+    LESS_EQUAL,
+    GREATER,
+    GREATER_EQUAL,
+    LOGICAL_AND,
+    LOGICAL_OR,
+    ARROW,
+    ELLIPSIS,
+    BANG,
+    LPAREN,
+    RPAREN,
+    LBRACE,
+    RBRACE,
+    LBRACKET,
+    RBRACKET,
+    COMMA,
+    COLON,
+    SEMICOLON,
+    DOT,
+    LINK,
+    LINK_NAME,
+    DECL_ASSIGN,
+    HASH
+}
+
+public struct Token {
+    type: TokenKind
+    value: string
+    line: int
+    column: int
+    end_line: int
+    end_column: int
+}
+
+var Keywords: map[string]TokenKind = map[string]TokenKind{
+    "var": TokenKind.VAR,
+    "int": TokenKind.INT,
+    "float": TokenKind.FLOAT,
+    "bool": TokenKind.BOOL,
+    "char": TokenKind.CHAR,
+    "string": TokenKind.STRING,
+    "error": TokenKind.ERROR,
+    "true": TokenKind.TRUE,
+    "false": TokenKind.FALSE,
+    "nil": TokenKind.NIL,
+    "print": TokenKind.PRINT,
+    "if": TokenKind.IF,
+    "else": TokenKind.ELSE,
+    "while": TokenKind.WHILE,
+    "for": TokenKind.FOR,
+    "match": TokenKind.MATCH,
+    "break": TokenKind.BREAK,
+    "continue": TokenKind.CONTINUE,
+    "and": TokenKind.AND,
+    "or": TokenKind.OR,
+    "not": TokenKind.NOT,
+    "func": TokenKind.FUNC,
+    "struct": TokenKind.STRUCT,
+    "enum": TokenKind.ENUM,
+    "return": TokenKind.RETURN,
+    "void": TokenKind.VOID,
+    "package": TokenKind.PACKAGE,
+    "import": TokenKind.IMPORT,
+    "public": TokenKind.PUBLIC,
+    "as": TokenKind.AS,
+    "from": TokenKind.FROM,
+    "extern": TokenKind.EXTERN,
+    "owned": TokenKind.OWNED,
+    "link": TokenKind.LINK,
+    "link_name": TokenKind.LINK_NAME
+}
+
+var ThreeCharSymbols: map[string]TokenKind = map[string]TokenKind{
+    "...": TokenKind.ELLIPSIS
+}
+
+var TwoCharSymbols: map[string]TokenKind = map[string]TokenKind{
+    "==": TokenKind.EQUAL,
+    "!=": TokenKind.NOT_EQUAL,
+    "<=": TokenKind.LESS_EQUAL,
+    ">=": TokenKind.GREATER_EQUAL,
+    "&&": TokenKind.LOGICAL_AND,
+    "||": TokenKind.LOGICAL_OR,
+    "->": TokenKind.ARROW,
+    ":=": TokenKind.DECL_ASSIGN
+}
+
+var Symbols: map[string]TokenKind = map[string]TokenKind{
+    "+": TokenKind.PLUS,
+    "-": TokenKind.MINUS,
+    "*": TokenKind.STAR,
+    "/": TokenKind.SLASH,
+    "%": TokenKind.PERCENT,
+    "=": TokenKind.ASSIGN,
+    "<": TokenKind.LESS,
+    ">": TokenKind.GREATER,
+    "!": TokenKind.BANG,
+    "(": TokenKind.LPAREN,
+    ")": TokenKind.RPAREN,
+    "{": TokenKind.LBRACE,
+    "}": TokenKind.RBRACE,
+    "[": TokenKind.LBRACKET,
+    "]": TokenKind.RBRACKET,
+    ",": TokenKind.COMMA,
+    ":": TokenKind.COLON,
+    ";": TokenKind.SEMICOLON,
+    ".": TokenKind.DOT,
+    "#": TokenKind.HASH
+}
+
+var IdentifierStart: char[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_".(char[])
+var IdentifierPart: char[] = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ_0123456789".(char[])
+var Digits: char[] = "0123456789".(char[])
+var Whitespace: char[] = " \t\r\n".(char[])
+
+public func Text2Token(text: string) -> Token[] {
+    var chars: char[] = text.(char[])
+    var tokens: Token[] = {}
+    var i: int = 0
+    var line: int = 1
+    var column: int = 1
+
+    for (; i < len(chars); ) {
+        var current: char = chars[i]
+
+        if (Whitespace.has(current)) {
+            if (current == '\n') {
+                line = line + 1
+                column = 1
+            } else {
+                column = column + 1
+            }
+            i = i + 1
+            continue
+        }
+
+        if (current == '/' && i + 1 < len(chars) && chars[i + 1] == '/') {
+            i = i + 2
+            column = column + 2
+            for (; i < len(chars) && chars[i] != '\n'; ) {
+                i = i + 1
+                column = column + 1
+            }
+            continue
+        }
+
+        if (current == '/' && i + 1 < len(chars) && chars[i + 1] == '*') {
+            var comment_line: int = line
+            var comment_column: int = column
+            i = i + 2
+            column = column + 2
+            var closed: bool = false
+            for (; i < len(chars); ) {
+                if (chars[i] == '*' && i + 1 < len(chars) && chars[i + 1] == '/') {
+                    i = i + 2
+                    column = column + 2
+                    closed = true
+                    break
+                }
+                if (chars[i] == '\n') {
+                    line = line + 1
+                    column = 1
+                } else {
+                    column = column + 1
+                }
+                i = i + 1
+            }
+            if (!closed) {
+                tokens.append(Token{
+                    type: TokenKind.ILLEGAL
+                    value: "unterminated block comment"
+                    line: comment_line
+                    column: comment_column
+                    end_line: line
+                    end_column: column
+                })
+                tokens.append(Token{
+                    type: TokenKind.EOF
+                    value: ""
+                    line: line
+                    column: column
+                    end_line: line
+                    end_column: column
+                })
+                return tokens
+            }
+            continue
+        }
+
+        if (IdentifierStart.has(current)) {
+            var start_line: int = line
+            var start_column: int = column
+            var buffer: char[] = {}
+            for (; i < len(chars) && IdentifierPart.has(chars[i]); ) {
+                buffer.append(chars[i])
+                i = i + 1
+                column = column + 1
+            }
+            var value: string = buffer.(string)
+            var kind: TokenKind = TokenKind.IDENT
+            if (Keywords.has(value)) {
+                kind = Keywords[value]
+            }
+            tokens.append(Token{
+                type: kind
+                value: value
+                line: start_line
+                column: start_column
+                end_line: line
+                end_column: column
+            })
+            continue
+        }
+
+        if (Digits.has(current)) {
+            var start_line: int = line
+            var start_column: int = column
+            var buffer: char[] = {}
+            var kind: TokenKind = TokenKind.INT_LIT
+            for (; i < len(chars) && Digits.has(chars[i]); ) {
+                buffer.append(chars[i])
+                i = i + 1
+                column = column + 1
+            }
+            if (i + 1 < len(chars) && chars[i] == '.' && Digits.has(chars[i + 1])) {
+                kind = TokenKind.FLOAT_LIT
+                buffer.append(chars[i])
+                i = i + 1
+                column = column + 1
+                for (; i < len(chars) && Digits.has(chars[i]); ) {
+                    buffer.append(chars[i])
+                    i = i + 1
+                    column = column + 1
+                }
+            }
+            if (i < len(chars) && (chars[i] == 'e' || chars[i] == 'E')) {
+                kind = TokenKind.FLOAT_LIT
+                buffer.append(chars[i])
+                i = i + 1
+                column = column + 1
+                if (i < len(chars) && (chars[i] == '+' || chars[i] == '-')) {
+                    buffer.append(chars[i])
+                    i = i + 1
+                    column = column + 1
+                }
+                if (i >= len(chars) || !Digits.has(chars[i])) {
+                    tokens.append(Token{
+                        type: TokenKind.ILLEGAL
+                        value: "malformed float exponent"
+                        line: start_line
+                        column: start_column
+                        end_line: line
+                        end_column: column
+                    })
+                    tokens.append(Token{
+                        type: TokenKind.EOF
+                        value: ""
+                        line: line
+                        column: column
+                        end_line: line
+                        end_column: column
+                    })
+                    return tokens
+                }
+                for (; i < len(chars) && Digits.has(chars[i]); ) {
+                    buffer.append(chars[i])
+                    i = i + 1
+                    column = column + 1
+                }
+            }
+            tokens.append(Token{
+                type: kind
+                value: buffer.(string)
+                line: start_line
+                column: start_column
+                end_line: line
+                end_column: column
+            })
+            continue
+        }
+
+        if (current == '`' && i + 1 < len(chars) && chars[i + 1] == '`') {
+            var start_line: int = line
+            var start_column: int = column
+            var buffer: char[] = {}
+            i = i + 2
+            column = column + 2
+            var closed: bool = false
+            for (; i < len(chars); ) {
+                if (chars[i] == '`' && i + 1 < len(chars) && chars[i + 1] == '`') {
+                    i = i + 2
+                    column = column + 2
+                    closed = true
+                    break
+                }
+                if (chars[i] == '\n') {
+                    line = line + 1
+                    column = 1
+                } else {
+                    column = column + 1
+                }
+                buffer.append(chars[i])
+                i = i + 1
+            }
+            if (!closed) {
+                tokens.append(Token{
+                    type: TokenKind.ILLEGAL
+                    value: "unterminated raw string literal"
+                    line: start_line
+                    column: start_column
+                    end_line: line
+                    end_column: column
+                })
+            } else {
+                tokens.append(Token{
+                    type: TokenKind.RAW_STRING_LIT
+                    value: buffer.(string)
+                    line: start_line
+                    column: start_column
+                    end_line: line
+                    end_column: column
+                })
+            }
+            continue
+        }
+
+        if (current == '"') {
+            var start_line: int = line
+            var start_column: int = column
+            var buffer: char[] = {}
+            i = i + 1
+            column = column + 1
+            var closed: bool = false
+            for (; i < len(chars); ) {
+                if (chars[i] == '"') {
+                    i = i + 1
+                    column = column + 1
+                    closed = true
+                    break
+                }
+                if (chars[i] == '\n') {
+                    break
+                }
+                if (chars[i] == '\\') {
+                    if (i + 1 >= len(chars)) {
+                        break
+                    }
+                    i = i + 1
+                    column = column + 1
+                    if (chars[i] == 'n') {
+                        buffer.append('\n')
+                    } else if (chars[i] == 't') {
+                        buffer.append('\t')
+                    } else if (chars[i] == 'r') {
+                        buffer.append('\r')
+                    } else if (chars[i] == '0') {
+                        buffer.append('\0')
+                    } else if (chars[i] == '\\' || chars[i] == '"' || chars[i] == '\'') {
+                        buffer.append(chars[i])
+                    } else {
+                        tokens.append(Token{
+                            type: TokenKind.ILLEGAL
+                            value: "invalid escape sequence"
+                            line: line
+                            column: column
+                            end_line: line
+                            end_column: column
+                        })
+                        tokens.append(Token{
+                            type: TokenKind.EOF
+                            value: ""
+                            line: line
+                            column: column
+                            end_line: line
+                            end_column: column
+                        })
+                        return tokens
+                    }
+                    i = i + 1
+                    column = column + 1
+                    continue
+                }
+                if (chars[i] == '\n') {
+                    line = line + 1
+                    column = 1
+                } else {
+                    column = column + 1
+                }
+                buffer.append(chars[i])
+                i = i + 1
+            }
+            if (!closed) {
+                tokens.append(Token{
+                    type: TokenKind.ILLEGAL
+                    value: "unterminated string literal"
+                    line: start_line
+                    column: start_column
+                    end_line: line
+                    end_column: column
+                })
+            } else {
+                tokens.append(Token{
+                    type: TokenKind.STRING_LIT
+                    value: buffer.(string)
+                    line: start_line
+                    column: start_column
+                    end_line: line
+                    end_column: column
+                })
+            }
+            continue
+        }
+
+        if (current == '\'') {
+            var start_line: int = line
+            var start_column: int = column
+            var buffer: char[] = {}
+            i = i + 1
+            column = column + 1
+            var closed: bool = false
+            for (; i < len(chars); ) {
+                if (chars[i] == '\'') {
+                    i = i + 1
+                    column = column + 1
+                    closed = true
+                    break
+                }
+                if (chars[i] == '\n') {
+                    break
+                }
+                if (chars[i] == '\\') {
+                    if (i + 1 >= len(chars)) {
+                        break
+                    }
+                    i = i + 1
+                    column = column + 1
+                    if (chars[i] == 'n') {
+                        buffer.append('\n')
+                    } else if (chars[i] == 't') {
+                        buffer.append('\t')
+                    } else if (chars[i] == 'r') {
+                        buffer.append('\r')
+                    } else if (chars[i] == '0') {
+                        buffer.append('\0')
+                    } else if (chars[i] == '\\' || chars[i] == '"' || chars[i] == '\'') {
+                        buffer.append(chars[i])
+                    } else {
+                        tokens.append(Token{
+                            type: TokenKind.ILLEGAL
+                            value: "invalid escape sequence"
+                            line: line
+                            column: column
+                            end_line: line
+                            end_column: column
+                        })
+                        tokens.append(Token{
+                            type: TokenKind.EOF
+                            value: ""
+                            line: line
+                            column: column
+                            end_line: line
+                            end_column: column
+                        })
+                        return tokens
+                    }
+                    i = i + 1
+                    column = column + 1
+                    continue
+                }
+                buffer.append(chars[i])
+                i = i + 1
+                column = column + 1
+            }
+            if (!closed || len(buffer) != 1) {
+                tokens.append(Token{
+                    type: TokenKind.ILLEGAL
+                    value: "invalid character literal"
+                    line: start_line
+                    column: start_column
+                    end_line: line
+                    end_column: column
+                })
+            } else {
+                tokens.append(Token{
+                    type: TokenKind.CHAR_LIT
+                    value: buffer.(string)
+                    line: start_line
+                    column: start_column
+                    end_line: line
+                    end_column: column
+                })
+            }
+            continue
+        }
+
+        var start_line: int = line
+        var start_column: int = column
+        var matched: bool = false
+        if (i + 2 < len(chars)) {
+            var triple_chars: char[] = { chars[i], chars[i + 1], chars[i + 2] }
+            var triple: string = triple_chars.(string)
+            if (ThreeCharSymbols.has(triple)) {
+                tokens.append(Token{
+                    type: ThreeCharSymbols[triple]
+                    value: triple
+                    line: start_line
+                    column: start_column
+                    end_line: start_line
+                    end_column: start_column + 3
+                })
+                i = i + 3
+                column = column + 3
+                matched = true
+            }
+        }
+        if (!matched && i + 1 < len(chars)) {
+            var pair_chars: char[] = { chars[i], chars[i + 1] }
+            var pair: string = pair_chars.(string)
+            if (TwoCharSymbols.has(pair)) {
+                tokens.append(Token{
+                    type: TwoCharSymbols[pair]
+                    value: pair
+                    line: start_line
+                    column: start_column
+                    end_line: start_line
+                    end_column: start_column + 2
+                })
+                i = i + 2
+                column = column + 2
+                matched = true
+            }
+        }
+        if (!matched) {
+            var symbol: string = current.(string)
+            if (Symbols.has(symbol)) {
+                tokens.append(Token{
+                    type: Symbols[symbol]
+                    value: symbol
+                    line: start_line
+                    column: start_column
+                    end_line: start_line
+                    end_column: start_column + 1
+                })
+            } else {
+                tokens.append(Token{
+                    type: TokenKind.ILLEGAL
+                    value: symbol
+                    line: start_line
+                    column: start_column
+                    end_line: start_line
+                    end_column: start_column + 1
+                })
+            }
+            i = i + 1
+            column = column + 1
+        }
+    }
+
+    tokens.append(Token{
+        type: TokenKind.EOF
+        value: ""
+        line: line
+        column: column
+        end_line: line
+        end_column: column
+    })
+    return tokens
+}

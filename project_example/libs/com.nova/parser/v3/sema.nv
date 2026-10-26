@@ -1,0 +1,1061 @@
+package parserv3
+
+public struct CheckResult {
+    success: bool
+    message: string
+    span: Span
+}
+
+struct Scope {
+    names: string[]
+    types: string[]
+}
+
+struct CheckerState {
+    type_names: string[]
+    functions: FuncDecl[]
+    structures: StructDecl[]
+    enumerations: EnumDecl[]
+    scopes: Scope[]
+    scope_depth: int
+    return_types: Type[]
+    loop_depth: int
+    failed: bool
+    message: string
+    error_span: Span
+}
+
+func sema_fail(state: *CheckerState, message: string, span: Span) -> void {
+    if (!state.failed) {
+        state.failed = true
+        state.message = message
+        state.error_span = span
+    }
+}
+
+func sema_type_name(value: Type) -> string {
+    var name: string = ""
+    match value {
+        Type.Named{ name: type_name, span: type_span } -> {
+            name = type_name
+        }
+        Type.Pointer{ element: element, span: type_span } -> {
+            name = "*" + sema_type_name(*element)
+        }
+        Type.Array{ element: element, span: type_span } -> {
+            name = sema_type_name(*element) + "[]"
+        }
+        Type.Map{ key: key, value: item, span: type_span } -> {
+            name = "map[" + sema_type_name(*key) + "]" + sema_type_name(*item)
+        }
+    }
+    return name
+}
+
+func sema_expr_span(expression: Expr) -> Span {
+    var result: Span = Span{ line: 1 column: 1 end_line: 1 end_column: 1 }
+    match expression {
+        Expr.Name{ name: value, span: node_span } -> { result = node_span }
+        Expr.Integer{ value: value, span: node_span } -> { result = node_span }
+        Expr.Float{ value: value, span: node_span } -> { result = node_span }
+        Expr.String{ value: value, span: node_span } -> { result = node_span }
+        Expr.RawString{ value: value, span: node_span } -> { result = node_span }
+        Expr.Character{ value: value, span: node_span } -> { result = node_span }
+        Expr.Boolean{ value: value, span: node_span } -> { result = node_span }
+        Expr.Nil{ span: node_span } -> { result = node_span }
+        Expr.Array{ elements: elements, span: node_span } -> { result = node_span }
+        Expr.Map{ type: map_type, entries: entries, span: node_span } -> { result = node_span }
+        Expr.Structure{ type_name: type_name, fields: fields, span: node_span } -> { result = node_span }
+        Expr.New{ type: allocated_type, span: node_span } -> { result = node_span }
+        Expr.Unary{ operator: operator, operand: operand, span: node_span } -> { result = node_span }
+        Expr.Binary{ operator: operator, left: left, right: right, span: node_span } -> { result = node_span }
+        Expr.Call{ callee: callee, arguments: arguments, span: node_span } -> { result = node_span }
+        Expr.Index{ target: target, index: index, span: node_span } -> { result = node_span }
+        Expr.Field{ target: target, name: name, span: node_span } -> { result = node_span }
+        Expr.TypeAssert{ target: target, type: asserted, span: node_span } -> { result = node_span }
+    }
+    return result
+}
+
+func sema_has_type(state: *CheckerState, name: string) -> bool {
+    if (
+        name == "int"
+        || name == "float"
+        || name == "bool"
+        || name == "char"
+        || name == "string"
+        || name == "error"
+        || name == "any"
+        || name == "void"
+    ) {
+        return true
+    }
+    return state.type_names.has(name)
+}
+
+func sema_check_type(state: *CheckerState, value: Type) -> void {
+    if (state.failed) {
+        return
+    }
+    match value {
+        Type.Named{ name: name, span: span } -> {
+            if (!sema_has_type(state, name)) {
+                sema_fail(state, "unknown type '" + name + "'", span)
+            } else if (name == "void") {
+                sema_fail(state, "void is not a value type", span)
+            }
+        }
+        Type.Pointer{ element: element, span: span } -> {
+            sema_check_type(state, *element)
+        }
+        Type.Array{ element: element, span: span } -> {
+            sema_check_type(state, *element)
+        }
+        Type.Map{ key: key, value: item, span: span } -> {
+            sema_check_type(state, *key)
+            sema_check_type(state, *item)
+            var key_name: string = sema_type_name(*key)
+            if (key_name != "int" && key_name != "string") {
+                sema_fail(state, "map key type must be string or int", span)
+            }
+        }
+    }
+}
+
+func sema_check_return_type(state: *CheckerState, value: Type) -> void {
+    match value {
+        Type.Named{ name: name, span: span } -> {
+            if (name != "void") {
+                sema_check_type(state, value)
+            }
+        }
+        Type.Pointer{ element: element, span: span } -> {
+            sema_check_type(state, value)
+        }
+        Type.Array{ element: element, span: span } -> {
+            sema_check_type(state, value)
+        }
+        Type.Map{ key: key, value: item, span: span } -> {
+            sema_check_type(state, value)
+        }
+    }
+}
+
+func sema_push_scope(state: *CheckerState) -> void {
+    if (state.scope_depth == len(state.scopes)) {
+        state.scopes.append(Scope{ names: {} types: {} })
+    } else {
+        state.scopes[state.scope_depth] = Scope{ names: {} types: {} }
+    }
+    state.scope_depth = state.scope_depth + 1
+}
+
+func sema_pop_scope(state: *CheckerState) -> void {
+    if (state.scope_depth > 1) {
+        state.scope_depth = state.scope_depth - 1
+    }
+}
+
+func sema_declare(
+    state: *CheckerState,
+    name: string,
+    type_name: string,
+    span: Span
+) -> void {
+    if (state.failed) {
+        return
+    }
+    var index: int = state.scope_depth - 1
+    if (state.scopes[index].names.has(name)) {
+        sema_fail(state, "variable '" + name + "' is already declared in this scope", span)
+        return
+    }
+    state.scopes[index].names.append(name)
+    state.scopes[index].types.append(type_name)
+}
+
+func sema_lookup(state: *CheckerState, name: string, span: Span) -> string {
+    for (var scope_index: int = state.scope_depth - 1; scope_index >= 0; scope_index = scope_index - 1) {
+        for (var index: int = 0; index < len(state.scopes[scope_index].names); index = index + 1) {
+            if (state.scopes[scope_index].names[index] == name) {
+                return state.scopes[scope_index].types[index]
+            }
+        }
+    }
+    sema_fail(state, "undefined variable '" + name + "'", span)
+    return ""
+}
+
+func sema_find_function(state: *CheckerState, name: string) -> int {
+    for (var index: int = 0; index < len(state.functions); index = index + 1) {
+        if (state.functions[index].name == name) {
+            return index
+        }
+    }
+    return -1
+}
+
+func sema_find_structure(state: *CheckerState, name: string) -> int {
+    for (var index: int = 0; index < len(state.structures); index = index + 1) {
+        if (state.structures[index].name == name) {
+            return index
+        }
+    }
+    return -1
+}
+
+func sema_find_enum(state: *CheckerState, name: string) -> int {
+    for (var index: int = 0; index < len(state.enumerations); index = index + 1) {
+        if (state.enumerations[index].name == name) {
+            return index
+        }
+    }
+    return -1
+}
+
+func sema_prefix_dot(name: string) -> string {
+    var chars: char[] = name.(char[])
+    var result: char[] = {}
+    for (var index: int = 0; index < len(chars); index = index + 1) {
+        if (chars[index] == '.') {
+            return result.(string)
+        }
+        result.append(chars[index])
+    }
+    return ""
+}
+
+func sema_suffix_dot(name: string) -> string {
+    var chars: char[] = name.(char[])
+    var result: char[] = {}
+    var after_dot: bool = false
+    for (var index: int = 0; index < len(chars); index = index + 1) {
+        if (after_dot) {
+            result.append(chars[index])
+        } else if (chars[index] == '.') {
+            after_dot = true
+        }
+    }
+    return result.(string)
+}
+
+func sema_assignable(expected: string, actual: string) -> bool {
+    if (expected == actual) {
+        return true
+    }
+    if (expected == "float" && actual == "int") {
+        return true
+    }
+    if (expected == "error" && actual == "nil") {
+        return true
+    }
+    if (sema_is_pointer(expected) && actual == "nil") {
+        return true
+    }
+    return expected == "any" && (
+        actual == "int"
+        || actual == "float"
+        || actual == "bool"
+        || actual == "string"
+    )
+}
+
+func sema_numeric(name: string) -> bool {
+    return name == "int" || name == "float"
+}
+
+func sema_is_pointer(name: string) -> bool {
+    var chars: char[] = name.(char[])
+    return len(chars) > 0 && chars[0] == '*'
+}
+
+func sema_is_array(name: string) -> bool {
+    var chars: char[] = name.(char[])
+    return len(chars) > 2 && chars[len(chars) - 2] == '[' && chars[len(chars) - 1] == ']'
+}
+
+func sema_remove_pointer(name: string) -> string {
+    var source: char[] = name.(char[])
+    var result: char[] = {}
+    for (var index: int = 1; index < len(source); index = index + 1) {
+        result.append(source[index])
+    }
+    return result.(string)
+}
+
+func sema_remove_array_suffix(name: string) -> string {
+    var source: char[] = name.(char[])
+    var result: char[] = {}
+    if (len(source) > 2) {
+        for (var index: int = 0; index < len(source) - 2; index = index + 1) {
+            result.append(source[index])
+        }
+    }
+    return result.(string)
+}
+
+func sema_expr(state: *CheckerState, expression: Expr) -> string {
+    if (state.failed) {
+        return ""
+    }
+    var result: string = ""
+    match expression {
+        Expr.Name{ name: name, span: span } -> {
+            result = sema_lookup(state, name, span)
+        }
+        Expr.Integer{ value: value, span: span } -> {
+            result = "int"
+        }
+        Expr.Float{ value: value, span: span } -> {
+            result = "float"
+        }
+        Expr.String{ value: value, span: span } -> {
+            result = "string"
+        }
+        Expr.RawString{ value: value, span: span } -> {
+            result = "string"
+        }
+        Expr.Character{ value: value, span: span } -> {
+            result = "char"
+        }
+        Expr.Boolean{ value: value, span: span } -> {
+            result = "bool"
+        }
+        Expr.Nil{ span: span } -> {
+            result = "nil"
+        }
+        Expr.Array{ elements: elements, span: span } -> {
+            if (len(elements) == 0) {
+                sema_fail(state, "cannot infer the type of an empty array", span)
+            } else {
+                var element_type: string = sema_expr(state, elements[0])
+                for (var index: int = 1; index < len(elements); index = index + 1) {
+                    var item_type: string = sema_expr(state, elements[index])
+                    if (item_type != element_type) {
+                        if (sema_numeric(item_type) && sema_numeric(element_type)) {
+                            element_type = "float"
+                        } else {
+                            sema_fail(state, "array elements must have compatible types", span)
+                        }
+                    }
+                }
+                result = element_type + "[]"
+            }
+        }
+        Expr.Map{ type: map_type, entries: entries, span: span } -> {
+            sema_check_type(state, map_type)
+            result = sema_type_name(map_type)
+            for (var index: int = 0; index < len(entries); index = index + 1) {
+                var key_type: string = sema_expr(state, entries[index].key)
+                var value_type: string = sema_expr(state, entries[index].value)
+                var expected_key: string = ""
+                var expected_value: string = ""
+                match map_type {
+                    Type.Map{ key: key, value: item, span: map_span } -> {
+                        expected_key = sema_type_name(*key)
+                        expected_value = sema_type_name(*item)
+                    }
+                    Type.Named{ name: name, span: type_span } -> {}
+                    Type.Pointer{ element: element, span: type_span } -> {}
+                    Type.Array{ element: element, span: type_span } -> {}
+                }
+                if (!sema_assignable(expected_key, key_type)) {
+                    sema_fail(state, "map key has an incompatible type", entries[index].span)
+                }
+                if (!sema_assignable(expected_value, value_type)) {
+                    sema_fail(state, "map value has an incompatible type", entries[index].span)
+                }
+            }
+        }
+        Expr.Structure{ type_name: type_name, fields: fields, span: span } -> {
+            var structure_index: int = sema_find_structure(state, type_name)
+            var enum_name: string = sema_prefix_dot(type_name)
+            var variant_name: string = sema_suffix_dot(type_name)
+            var enum_index: int = sema_find_enum(state, enum_name)
+            if (enum_index >= 0) {
+                var enumeration: EnumDecl = state.enumerations[enum_index]
+                var variant_index: int = -1
+                for (var index: int = 0; index < len(enumeration.variants); index = index + 1) {
+                    if (enumeration.variants[index].name == variant_name) {
+                        variant_index = index
+                    }
+                }
+                if (variant_index < 0) {
+                    sema_fail(state, "enum '" + enum_name + "' has no variant '" + variant_name + "'", span)
+                } else {
+                    var variant: EnumVariant = enumeration.variants[variant_index]
+                    for (var index: int = 0; index < len(fields); index = index + 1) {
+                        var payload_index: int = -1
+                        for (var declared_index: int = 0; declared_index < len(variant.fields); declared_index = declared_index + 1) {
+                            if (variant.fields[declared_index].name == fields[index].name) {
+                                payload_index = declared_index
+                            }
+                        }
+                        if (payload_index < 0) {
+                            sema_fail(state, "enum variant has no payload field '" + fields[index].name + "'", fields[index].span)
+                        } else {
+                            for (var prior_index: int = 0; prior_index < index; prior_index = prior_index + 1) {
+                                if (fields[prior_index].name == fields[index].name) {
+                                    sema_fail(state, "enum payload field is initialized more than once", fields[index].span)
+                                }
+                            }
+                            var actual: string = sema_expr(state, fields[index].value)
+                            var expected: string = sema_type_name(variant.fields[payload_index].type)
+                            if (!sema_assignable(expected, actual)) {
+                                sema_fail(state, "enum payload has an incompatible type", fields[index].span)
+                            }
+                        }
+                    }
+                    if (len(fields) != len(variant.fields)) {
+                        sema_fail(state, "enum payload fields do not match the variant", span)
+                    }
+                }
+                result = enum_name
+            } else if (structure_index < 0) {
+                sema_fail(state, "unknown structure '" + type_name + "'", span)
+            } else {
+                var structure: StructDecl = state.structures[structure_index]
+                for (var index: int = 0; index < len(fields); index = index + 1) {
+                    var field_index: int = -1
+                    for (var declared_index: int = 0; declared_index < len(structure.fields); declared_index = declared_index + 1) {
+                        if (structure.fields[declared_index].name == fields[index].name) {
+                            field_index = declared_index
+                        }
+                    }
+                    if (field_index < 0) {
+                        sema_fail(state, "structure has no field '" + fields[index].name + "'", fields[index].span)
+                    } else {
+                        for (var prior_index: int = 0; prior_index < index; prior_index = prior_index + 1) {
+                            if (fields[prior_index].name == fields[index].name) {
+                                sema_fail(state, "structure field is initialized more than once", fields[index].span)
+                            }
+                        }
+                        var actual: string = sema_expr(state, fields[index].value)
+                        var expected: string = sema_type_name(structure.fields[field_index].type)
+                        if (!sema_assignable(expected, actual)) {
+                            sema_fail(state, "structure field has an incompatible type", fields[index].span)
+                        }
+                    }
+                }
+                for (var declared_index: int = 0; declared_index < len(structure.fields); declared_index = declared_index + 1) {
+                    var initialized: bool = false
+                    for (var field_index: int = 0; field_index < len(fields); field_index = field_index + 1) {
+                        if (fields[field_index].name == structure.fields[declared_index].name) {
+                            initialized = true
+                        }
+                    }
+                    if (!initialized && structure.fields[declared_index].default_value == nil) {
+                        sema_fail(state, "structure literal is missing field '" + structure.fields[declared_index].name + "'", span)
+                    }
+                }
+                result = type_name
+            }
+        }
+        Expr.New{ type: allocated_type, span: span } -> {
+            sema_check_type(state, allocated_type)
+            result = "*" + sema_type_name(allocated_type)
+        }
+        Expr.Unary{ operator: operator, operand: operand, span: span } -> {
+            var operand_type: string = sema_expr(state, *operand)
+            if (operator == UnaryOperator.NEGATE) {
+                if (!sema_numeric(operand_type)) {
+                    sema_fail(state, "unary minus expects a number", span)
+                }
+                result = operand_type
+            } else if (operator == UnaryOperator.NOT) {
+                if (operand_type != "bool") {
+                    sema_fail(state, "logical not expects bool", span)
+                }
+                result = "bool"
+            } else {
+                if (!sema_is_pointer(operand_type)) {
+                    sema_fail(state, "cannot dereference a non-pointer value", span)
+                } else {
+                    result = sema_remove_pointer(operand_type)
+                }
+            }
+        }
+        Expr.Binary{ operator: operator, left: left, right: right, span: span } -> {
+            var left_type: string = sema_expr(state, *left)
+            var right_type: string = sema_expr(state, *right)
+            if (
+                operator == BinaryOperator.ADD
+                || operator == BinaryOperator.SUBTRACT
+                || operator == BinaryOperator.MULTIPLY
+                || operator == BinaryOperator.DIVIDE
+                || operator == BinaryOperator.REMAINDER
+            ) {
+                if (operator == BinaryOperator.ADD && left_type == "string" && right_type == "string") {
+                    result = "string"
+                } else if (sema_numeric(left_type) && sema_numeric(right_type)) {
+                    result = "int"
+                    if (left_type == "float" || right_type == "float") {
+                        result = "float"
+                    }
+                } else {
+                    sema_fail(state, "arithmetic operator has incompatible operands", span)
+                }
+            } else if (
+                operator == BinaryOperator.LESS
+                || operator == BinaryOperator.LESS_EQUAL
+                || operator == BinaryOperator.GREATER
+                || operator == BinaryOperator.GREATER_EQUAL
+            ) {
+                if (!sema_numeric(left_type) || !sema_numeric(right_type)) {
+                    sema_fail(state, "comparison expects numeric operands", span)
+                }
+                result = "bool"
+            } else if (
+                operator == BinaryOperator.AND
+                || operator == BinaryOperator.OR
+            ) {
+                if (left_type != "bool" || right_type != "bool") {
+                    sema_fail(state, "logical operators expect bool operands", span)
+                }
+                result = "bool"
+            } else {
+                if (!sema_assignable(left_type, right_type) && !sema_assignable(right_type, left_type)) {
+                    sema_fail(state, "cannot compare values of different types", span)
+                }
+                result = "bool"
+            }
+        }
+        Expr.Call{ callee: callee, arguments: arguments, span: span } -> {
+            var function_name: string = ""
+            match *callee {
+                Expr.Name{ name: name, span: callee_span } -> {
+                    function_name = name
+                }
+                Expr.Integer{ value: value, span: callee_span } -> {}
+                Expr.Float{ value: value, span: callee_span } -> {}
+                Expr.String{ value: value, span: callee_span } -> {}
+                Expr.RawString{ value: value, span: callee_span } -> {}
+                Expr.Character{ value: value, span: callee_span } -> {}
+                Expr.Boolean{ value: value, span: callee_span } -> {}
+                Expr.Nil{ span: callee_span } -> {}
+                Expr.Array{ elements: elements, span: callee_span } -> {}
+                Expr.Map{ type: map_type, entries: entries, span: callee_span } -> {}
+                Expr.Structure{ type_name: type_name, fields: fields, span: callee_span } -> {}
+                Expr.New{ type: allocated_type, span: callee_span } -> {}
+                Expr.Unary{ operator: operator, operand: operand, span: callee_span } -> {}
+                Expr.Binary{ operator: operator, left: left, right: right, span: callee_span } -> {}
+                Expr.Call{ callee: inner, arguments: args, span: callee_span } -> {}
+                Expr.Index{ target: target, index: index, span: callee_span } -> {}
+                Expr.Field{ target: target, name: name, span: callee_span } -> {}
+                Expr.TypeAssert{ target: target, type: asserted, span: callee_span } -> {}
+            }
+            var function_index: int = sema_find_function(state, function_name)
+            if (function_index < 0) {
+                sema_fail(state, "undefined function '" + function_name + "'", span)
+            } else {
+                var function: FuncDecl = state.functions[function_index]
+                if (len(arguments) != len(function.parameters)) {
+                    sema_fail(state, "wrong number of function arguments", span)
+                } else {
+                    for (var index: int = 0; index < len(arguments); index = index + 1) {
+                        var argument_type: string = sema_expr(state, arguments[index])
+                        var parameter_type: string = sema_type_name(function.parameters[index].type)
+                        if (!sema_assignable(parameter_type, argument_type)) {
+                            sema_fail(state, "function argument has an incompatible type", sema_expr_span(arguments[index]))
+                        }
+                    }
+                }
+                if (len(function.return_types) == 1 && sema_type_name(function.return_types[0]) == "void") {
+                    result = "void"
+                } else if (len(function.return_types) == 1) {
+                    result = sema_type_name(function.return_types[0])
+                } else if (len(function.return_types) > 1) {
+                    sema_fail(state, "multiple return values cannot be used as one expression", span)
+                } else {
+                    sema_fail(state, "void function cannot be used as a value", span)
+                }
+            }
+        }
+        Expr.Index{ target: target, index: index, span: span } -> {
+            var target_type: string = sema_expr(state, *target)
+            var index_type: string = sema_expr(state, *index)
+            if (sema_is_array(target_type)) {
+                if (index_type != "int") {
+                    sema_fail(state, "array index must be int", span)
+                }
+                result = sema_remove_array_suffix(target_type)
+            } else {
+                sema_fail(state, "cannot index a non-array value", span)
+            }
+        }
+        Expr.Field{ target: target, name: name, span: span } -> {
+            var enum_name: string = ""
+            match *target {
+                Expr.Name{ name: target_name, span: target_span } -> {
+                    if (sema_find_enum(state, target_name) >= 0) {
+                        enum_name = target_name
+                    }
+                }
+                Expr.Integer{ value: value, span: target_span } -> {}
+                Expr.Float{ value: value, span: target_span } -> {}
+                Expr.String{ value: value, span: target_span } -> {}
+                Expr.RawString{ value: value, span: target_span } -> {}
+                Expr.Character{ value: value, span: target_span } -> {}
+                Expr.Boolean{ value: value, span: target_span } -> {}
+                Expr.Nil{ span: target_span } -> {}
+                Expr.Array{ elements: elements, span: target_span } -> {}
+                Expr.Map{ type: map_type, entries: entries, span: target_span } -> {}
+                Expr.Structure{ type_name: structure_name, fields: fields, span: target_span } -> {}
+                Expr.New{ type: allocated_type, span: target_span } -> {}
+                Expr.Unary{ operator: operator, operand: operand, span: target_span } -> {}
+                Expr.Binary{ operator: operator, left: left, right: right, span: target_span } -> {}
+                Expr.Call{ callee: callee, arguments: arguments, span: target_span } -> {}
+                Expr.Index{ target: indexed, index: index, span: target_span } -> {}
+                Expr.Field{ target: nested, name: field_name, span: target_span } -> {}
+                Expr.TypeAssert{ target: asserted, type: asserted_type, span: target_span } -> {}
+            }
+            if (enum_name != "") {
+                var enumeration: EnumDecl = state.enumerations[sema_find_enum(state, enum_name)]
+                var variant_found: bool = false
+                for (var index: int = 0; index < len(enumeration.variants); index = index + 1) {
+                    if (enumeration.variants[index].name == name) {
+                        variant_found = true
+                    }
+                }
+                if (variant_found) {
+                    result = enum_name
+                } else {
+                    sema_fail(state, "enum '" + enum_name + "' has no variant '" + name + "'", span)
+                }
+            } else {
+            var target_type: string = sema_expr(state, *target)
+            if (sema_is_pointer(target_type)) {
+                target_type = sema_remove_pointer(target_type)
+            }
+            var structure_index: int = sema_find_structure(state, target_type)
+            if (structure_index >= 0) {
+                var structure: StructDecl = state.structures[structure_index]
+                var found: bool = false
+                for (var index: int = 0; index < len(structure.fields); index = index + 1) {
+                    if (structure.fields[index].name == name) {
+                        result = sema_type_name(structure.fields[index].type)
+                        found = true
+                    }
+                }
+                if (!found) {
+                    sema_fail(state, "structure '" + target_type + "' has no field '" + name + "'", span)
+                }
+            } else {
+                sema_fail(state, "field access requires a structure value", span)
+            }
+            }
+        }
+        Expr.TypeAssert{ target: target, type: asserted_type, span: span } -> {
+            sema_expr(state, *target)
+            sema_check_type(state, asserted_type)
+            result = sema_type_name(asserted_type)
+        }
+    }
+    return result
+}
+
+func sema_statement(state: *CheckerState, statement: Stmt) -> void {
+    if (state.failed) {
+        return
+    }
+    match statement {
+        Stmt.Variable{ declaration: declaration, span: span } -> {
+            sema_check_type(state, declaration.type)
+            if (declaration.initializer == nil) {
+                sema_fail(state, "variable initializer is required", declaration.span)
+            } else {
+                var actual: string = sema_expr(state, *declaration.initializer)
+                var expected: string = sema_type_name(declaration.type)
+                if (!sema_assignable(expected, actual)) {
+                    sema_fail(state, "variable initializer has an incompatible type", declaration.span)
+                } else {
+                    sema_declare(state, declaration.name, expected, declaration.span)
+                }
+            }
+        }
+        Stmt.Block{ statements: statements, span: span } -> {
+            sema_push_scope(state)
+            for (var index: int = 0; index < len(statements) && !state.failed; index = index + 1) {
+                sema_statement(state, statements[index])
+            }
+            sema_pop_scope(state)
+        }
+        Stmt.If{ condition: condition, then_branch: then_branch, else_branch: else_branch, span: span } -> {
+            var condition_type: string = sema_expr(state, condition)
+            if (condition_type != "bool") {
+                sema_fail(state, "if condition must be bool", span)
+            }
+            sema_statement(state, *then_branch)
+            if (else_branch != nil) {
+                sema_statement(state, *else_branch)
+            }
+        }
+        Stmt.For{ initializer: initializer, condition: condition, increment: increment, body: body, span: span } -> {
+            sema_push_scope(state)
+            if (initializer != nil) {
+                sema_statement(state, *initializer)
+            }
+            if (condition != nil && sema_expr(state, *condition) != "bool") {
+                sema_fail(state, "for condition must be bool", span)
+            }
+            if (increment != nil) {
+                sema_statement(state, *increment)
+            }
+            state.loop_depth = state.loop_depth + 1
+            sema_statement(state, *body)
+            state.loop_depth = state.loop_depth - 1
+            sema_pop_scope(state)
+        }
+        Stmt.While{ condition: condition, body: body, span: span } -> {
+            if (sema_expr(state, condition) != "bool") {
+                sema_fail(state, "while condition must be bool", span)
+            }
+            state.loop_depth = state.loop_depth + 1
+            sema_statement(state, *body)
+            state.loop_depth = state.loop_depth - 1
+        }
+        Stmt.Match{ value: value, cases: cases, span: span } -> {
+            var match_type: string = sema_expr(state, value)
+            var enum_index: int = sema_find_enum(state, match_type)
+            if (enum_index < 0) {
+                sema_fail(state, "match value must have an enum type", span)
+            } else {
+                var enumeration: EnumDecl = state.enumerations[enum_index]
+                for (var index: int = 0; index < len(cases); index = index + 1) {
+                    if (cases[index].enum_type != match_type) {
+                        sema_fail(state, "match case uses the wrong enum type", cases[index].span)
+                    }
+                    var variant_index: int = -1
+                    for (var declared_index: int = 0; declared_index < len(enumeration.variants); declared_index = declared_index + 1) {
+                        if (enumeration.variants[declared_index].name == cases[index].variant) {
+                            variant_index = declared_index
+                        }
+                    }
+                    if (variant_index < 0) {
+                        sema_fail(state, "enum has no variant '" + cases[index].variant + "'", cases[index].span)
+                    } else {
+                        for (var prior_index: int = 0; prior_index < index; prior_index = prior_index + 1) {
+                            if (cases[prior_index].variant == cases[index].variant) {
+                                sema_fail(state, "enum variant appears more than once in match", cases[index].span)
+                            }
+                        }
+                        var variant: EnumVariant = enumeration.variants[variant_index]
+                        if (len(cases[index].bindings) != len(variant.fields)) {
+                            sema_fail(state, "match bindings do not match enum payload", cases[index].span)
+                        }
+                        sema_push_scope(state)
+                        for (var binding_index: int = 0; binding_index < len(cases[index].bindings); binding_index = binding_index + 1) {
+                            var payload_index: int = -1
+                            for (var field_index: int = 0; field_index < len(variant.fields); field_index = field_index + 1) {
+                                if (variant.fields[field_index].name == cases[index].bindings[binding_index].field_name) {
+                                    payload_index = field_index
+                                }
+                            }
+                            if (payload_index < 0) {
+                                sema_fail(state, "enum payload has no field '" + cases[index].bindings[binding_index].field_name + "'", cases[index].bindings[binding_index].span)
+                            } else {
+                                sema_declare(
+                                    state,
+                                    cases[index].bindings[binding_index].name,
+                                    sema_type_name(variant.fields[payload_index].type),
+                                    cases[index].bindings[binding_index].span
+                                )
+                            }
+                        }
+                        sema_statement(state, *cases[index].body)
+                        sema_pop_scope(state)
+                    }
+                }
+                if (len(cases) != len(enumeration.variants)) {
+                    sema_fail(state, "match must handle every enum variant", span)
+                }
+            }
+        }
+        Stmt.Return{ values: values, span: span } -> {
+            var expected_count: int = len(state.return_types)
+            if (expected_count == 1 && sema_type_name(state.return_types[0]) == "void") {
+                expected_count = 0
+            }
+            if (len(values) != expected_count) {
+                sema_fail(state, "return value count does not match function signature", span)
+            } else {
+                for (var index: int = 0; index < len(values); index = index + 1) {
+                    var actual: string = sema_expr(state, values[index])
+                    var expected: string = sema_type_name(state.return_types[index])
+                    if (!sema_assignable(expected, actual)) {
+                        sema_fail(state, "return value has an incompatible type", sema_expr_span(values[index]))
+                    }
+                }
+            }
+        }
+        Stmt.Break{ span: span } -> {
+            if (state.loop_depth == 0) {
+                sema_fail(state, "break is only valid inside a loop", span)
+            }
+        }
+        Stmt.Continue{ span: span } -> {
+            if (state.loop_depth == 0) {
+                sema_fail(state, "continue is only valid inside a loop", span)
+            }
+        }
+        Stmt.Print{ arguments: arguments, span: span } -> {
+            for (var index: int = 0; index < len(arguments); index = index + 1) {
+                sema_expr(state, arguments[index])
+            }
+        }
+        Stmt.Expression{ expression: expression, span: span } -> {
+            sema_expr(state, expression)
+        }
+        Stmt.Assignment{ target: target, value: value, span: span } -> {
+            var target_type: string = ""
+            var assignable_target: bool = false
+            match target {
+                Expr.Name{ name: name, span: target_span } -> {
+                    target_type = sema_lookup(state, name, target_span)
+                    assignable_target = true
+                }
+                Expr.Integer{ value: integer, span: target_span } -> {}
+                Expr.Float{ value: number, span: target_span } -> {}
+                Expr.String{ value: text, span: target_span } -> {}
+                Expr.RawString{ value: text, span: target_span } -> {}
+                Expr.Character{ value: character, span: target_span } -> {}
+                Expr.Boolean{ value: boolean, span: target_span } -> {}
+                Expr.Nil{ span: target_span } -> {}
+                Expr.Array{ elements: elements, span: target_span } -> {}
+                Expr.Map{ type: map_type, entries: entries, span: target_span } -> {}
+                Expr.Structure{ type_name: type_name, fields: fields, span: target_span } -> {}
+                Expr.New{ type: allocated_type, span: target_span } -> {}
+                Expr.Unary{ operator: operator, operand: operand, span: target_span } -> {
+                    if (operator == UnaryOperator.DEREFERENCE) {
+                        target_type = sema_expr(state, target)
+                        assignable_target = true
+                    }
+                }
+                Expr.Binary{ operator: operator, left: left, right: right, span: target_span } -> {}
+                Expr.Call{ callee: callee, arguments: arguments, span: target_span } -> {}
+                Expr.Index{ target: array, index: index, span: target_span } -> {
+                    target_type = sema_expr(state, target)
+                    assignable_target = true
+                }
+                Expr.Field{ target: object, name: field_name, span: target_span } -> {
+                    target_type = sema_expr(state, target)
+                    assignable_target = true
+                }
+                Expr.TypeAssert{ target: object, type: asserted, span: target_span } -> {}
+            }
+            var actual: string = sema_expr(state, value)
+            if (!assignable_target) {
+                sema_fail(state, "assignment target must be a variable, field, index, or dereference", span)
+            } else if (!sema_assignable(target_type, actual)) {
+                sema_fail(state, "assigned value has an incompatible type", span)
+            }
+        }
+    }
+}
+
+func sema_returns(statement: Stmt) -> bool {
+    var returns: bool = false
+    match statement {
+        Stmt.Return{ values: values, span: span } -> {
+            returns = true
+        }
+        Stmt.Block{ statements: statements, span: span } -> {
+            for (var index: int = 0; index < len(statements); index = index + 1) {
+                if (sema_returns(statements[index])) {
+                    returns = true
+                }
+            }
+        }
+        Stmt.If{ condition: condition, then_branch: then_branch, else_branch: else_branch, span: span } -> {
+            if (else_branch != nil) {
+                returns = sema_returns(*then_branch) && sema_returns(*else_branch)
+            }
+        }
+        Stmt.For{ initializer: initializer, condition: condition, increment: increment, body: body, span: span } -> {}
+        Stmt.While{ condition: condition, body: body, span: span } -> {}
+        Stmt.Match{ value: value, cases: cases, span: span } -> {
+            if (len(cases) > 0) {
+                returns = true
+                for (var index: int = 0; index < len(cases); index = index + 1) {
+                    if (!sema_returns(*cases[index].body)) {
+                        returns = false
+                    }
+                }
+            }
+        }
+        Stmt.Variable{ declaration: declaration, span: span } -> {}
+        Stmt.Break{ span: span } -> {}
+        Stmt.Continue{ span: span } -> {}
+        Stmt.Print{ arguments: arguments, span: span } -> {}
+        Stmt.Expression{ expression: expression, span: span } -> {}
+        Stmt.Assignment{ target: target, value: value, span: span } -> {}
+    }
+    return returns
+}
+
+public func Check(program: Program) -> CheckResult {
+    var state: *CheckerState = new(CheckerState);
+    *state = CheckerState{
+        type_names: {}
+        functions: {}
+        structures: {}
+        enumerations: {}
+        scopes: {}
+        scope_depth: 0
+        return_types: {}
+        loop_depth: 0
+        failed: false
+        message: ""
+        error_span: program.span
+    }
+    sema_push_scope(state)
+
+    for (var index: int = 0; index < len(program.items); index = index + 1) {
+        match program.items[index] {
+            Declaration.Structure{ declaration: structure } -> {
+                if (
+                    structure.name == "int"
+                    || structure.name == "float"
+                    || structure.name == "bool"
+                    || structure.name == "char"
+                    || structure.name == "string"
+                    || structure.name == "error"
+                    || structure.name == "any"
+                    || structure.name == "void"
+                    || state.type_names.has(structure.name)
+                ) {
+                    sema_fail(state, "type '" + structure.name + "' is already declared", structure.span)
+                } else {
+                    state.type_names.append(structure.name)
+                    state.structures.append(structure)
+                }
+            }
+            Declaration.Enumeration{ declaration: enumeration } -> {
+                if (
+                    enumeration.name == "int"
+                    || enumeration.name == "float"
+                    || enumeration.name == "bool"
+                    || enumeration.name == "char"
+                    || enumeration.name == "string"
+                    || enumeration.name == "error"
+                    || enumeration.name == "any"
+                    || enumeration.name == "void"
+                    || state.type_names.has(enumeration.name)
+                ) {
+                    sema_fail(state, "type '" + enumeration.name + "' is already declared", enumeration.span)
+                } else {
+                    state.type_names.append(enumeration.name)
+                    state.enumerations.append(enumeration)
+                }
+            }
+            Declaration.Function{ declaration: function } -> {
+                if (sema_find_function(state, function.name) >= 0) {
+                    sema_fail(state, "function '" + function.name + "' is already declared", function.span)
+                } else {
+                    state.functions.append(function)
+                }
+            }
+            Declaration.Import{ declaration: import_decl } -> {}
+            Declaration.Variable{ declaration: variable } -> {
+                sema_check_type(state, variable.type)
+                sema_declare(state, variable.name, sema_type_name(variable.type), variable.span)
+            }
+        }
+    }
+
+    for (var item_index: int = 0; item_index < len(program.items) && !state.failed; item_index = item_index + 1) {
+        match program.items[item_index] {
+            Declaration.Structure{ declaration: structure } -> {
+                for (var field_index: int = 0; field_index < len(structure.fields); field_index = field_index + 1) {
+                    for (var prior_index: int = 0; prior_index < field_index; prior_index = prior_index + 1) {
+                        if (structure.fields[prior_index].name == structure.fields[field_index].name) {
+                            sema_fail(state, "structure field is declared more than once", structure.fields[field_index].span)
+                        }
+                    }
+                    sema_check_type(state, structure.fields[field_index].type)
+                    if (structure.fields[field_index].default_value != nil) {
+                        var actual: string = sema_expr(state, *structure.fields[field_index].default_value)
+                        var expected: string = sema_type_name(structure.fields[field_index].type)
+                        if (!sema_assignable(expected, actual)) {
+                            sema_fail(state, "structure default has an incompatible type", structure.fields[field_index].span)
+                        }
+                    }
+                }
+            }
+            Declaration.Enumeration{ declaration: enumeration } -> {
+                if (len(enumeration.variants) == 0) {
+                    sema_fail(state, "enum must declare at least one variant", enumeration.span)
+                }
+                for (var variant_index: int = 0; variant_index < len(enumeration.variants); variant_index = variant_index + 1) {
+                    for (var prior_variant: int = 0; prior_variant < variant_index; prior_variant = prior_variant + 1) {
+                        if (enumeration.variants[prior_variant].name == enumeration.variants[variant_index].name) {
+                            sema_fail(state, "enum variant is declared more than once", enumeration.variants[variant_index].span)
+                        }
+                    }
+                    for (var field_index: int = 0; field_index < len(enumeration.variants[variant_index].fields); field_index = field_index + 1) {
+                        for (var prior_field: int = 0; prior_field < field_index; prior_field = prior_field + 1) {
+                            if (enumeration.variants[variant_index].fields[prior_field].name == enumeration.variants[variant_index].fields[field_index].name) {
+                                sema_fail(state, "enum payload field is declared more than once", enumeration.variants[variant_index].fields[field_index].span)
+                            }
+                        }
+                        sema_check_type(state, enumeration.variants[variant_index].fields[field_index].type)
+                    }
+                }
+            }
+            Declaration.Function{ declaration: function } -> {
+                for (var parameter_index: int = 0; parameter_index < len(function.parameters); parameter_index = parameter_index + 1) {
+                    sema_check_type(state, function.parameters[parameter_index].type)
+                }
+                for (var return_index: int = 0; return_index < len(function.return_types); return_index = return_index + 1) {
+                    sema_check_return_type(state, function.return_types[return_index])
+                }
+            }
+            Declaration.Import{ declaration: import_decl } -> {}
+            Declaration.Variable{ declaration: variable } -> {
+                if (variable.initializer == nil) {
+                    sema_fail(state, "variable initializer is required", variable.span)
+                } else {
+                    var actual: string = sema_expr(state, *variable.initializer)
+                    var expected: string = sema_type_name(variable.type)
+                    if (!sema_assignable(expected, actual)) {
+                        sema_fail(state, "variable initializer has an incompatible type", variable.span)
+                    }
+                }
+            }
+        }
+    }
+
+    for (var function_index: int = 0; function_index < len(state.functions) && !state.failed; function_index = function_index + 1) {
+        var function: FuncDecl = state.functions[function_index]
+        if (function.is_extern) {
+            continue
+        }
+        state.return_types = function.return_types
+        sema_push_scope(state)
+        for (var parameter_index: int = 0; parameter_index < len(function.parameters); parameter_index = parameter_index + 1) {
+            sema_declare(
+                state,
+                function.parameters[parameter_index].name,
+                sema_type_name(function.parameters[parameter_index].type),
+                function.parameters[parameter_index].span
+            )
+        }
+        if (function.body != nil) {
+            sema_statement(state, *function.body)
+            if (
+                len(function.return_types) > 0
+                && !(len(function.return_types) == 1 && sema_type_name(function.return_types[0]) == "void")
+                && !sema_returns(*function.body)
+            ) {
+                sema_fail(state, "function may not return a value on every path", function.span)
+            }
+        }
+        sema_pop_scope(state)
+    }
+
+    return CheckResult{
+        success: !state.failed
+        message: state.message
+        span: state.error_span
+    }
+}

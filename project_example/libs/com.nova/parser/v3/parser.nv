@@ -1,0 +1,1301 @@
+package parserv3
+
+import "com.nova/lexer"
+
+public struct ParseResult {
+    success: bool
+    program: Program
+    message: string
+    span: Span
+}
+
+func expression_name(expression: Expr) -> string {
+    var name: string = ""
+    match expression {
+        Expr.Name{ name: value, span: node_span } -> { name = value }
+        Expr.Field{ target: target, name: value, span: node_span } -> {
+            name = expression_name(*target) + "." + value
+        }
+        Expr.Integer{ value: value, span: node_span } -> {}
+        Expr.Float{ value: value, span: node_span } -> {}
+        Expr.String{ value: value, span: node_span } -> {}
+        Expr.RawString{ value: value, span: node_span } -> {}
+        Expr.Character{ value: value, span: node_span } -> {}
+        Expr.Boolean{ value: value, span: node_span } -> {}
+        Expr.Nil{ span: node_span } -> {}
+        Expr.Array{ elements: elements, span: node_span } -> {}
+        Expr.Map{ type: map_type, entries: entries, span: node_span } -> {}
+        Expr.Structure{ type_name: type_name, fields: fields, span: node_span } -> {}
+        Expr.New{ type: allocated_type, span: node_span } -> {}
+        Expr.Unary{ operator: operator, operand: operand, span: node_span } -> {}
+        Expr.Binary{ operator: operator, left: left, right: right, span: node_span } -> {}
+        Expr.Call{ callee: callee, arguments: arguments, span: node_span } -> {}
+        Expr.Index{ target: target, index: index, span: node_span } -> {}
+        Expr.TypeAssert{ target: target, type: type, span: node_span } -> {}
+    }
+    return name
+}
+
+struct ParserState {
+    tokens: lexer.Token[]
+    position: int
+    failed: bool
+    message: string
+    error_span: Span
+    allow_struct_literal: bool
+}
+
+func empty_span() -> Span {
+    return Span{ line: 1 column: 1 end_line: 1 end_column: 1 }
+}
+
+func span_between(start: lexer.Token, finish: lexer.Token) -> Span {
+    return Span{
+        line: start.line
+        column: start.column
+        end_line: finish.end_line
+        end_column: finish.end_column
+    }
+}
+
+func parser_current(parser: *ParserState) -> lexer.Token {
+    return parser.tokens[parser.position]
+}
+
+func parser_previous(parser: *ParserState) -> lexer.Token {
+    if (parser.position > 0) {
+        return parser.tokens[parser.position - 1]
+    }
+    return parser.tokens[0]
+}
+
+func parser_at(parser: *ParserState, kind: lexer.TokenKind) -> bool {
+    return parser_current(parser).type == kind
+}
+
+func parser_advance(parser: *ParserState) -> lexer.Token {
+    var token: lexer.Token = parser_current(parser)
+    if (token.type != lexer.TokenKind.EOF) {
+        parser.position = parser.position + 1
+    }
+    return token
+}
+
+func parser_fail(parser: *ParserState, message: string, token: lexer.Token) -> void {
+    if (!parser.failed) {
+        parser.failed = true
+        parser.message = message
+        parser.error_span = span_between(token, token)
+    }
+}
+
+func parser_expect(
+    parser: *ParserState,
+    kind: lexer.TokenKind,
+    description: string
+) -> lexer.Token {
+    if (parser.failed) {
+        return parser_current(parser)
+    }
+    if (!parser_at(parser, kind)) {
+        var token: lexer.Token = parser_current(parser)
+        if (token.type == lexer.TokenKind.EOF) {
+            parser_fail(parser, "expected " + description + " before end of file", token)
+        } else {
+            parser_fail(parser, "expected " + description + " before '" + token.value + "'", token)
+        }
+        return token
+    }
+    return parser_advance(parser)
+}
+
+func parser_has_line_break(parser: *ParserState) -> bool {
+    if (parser.position == 0) {
+        return false
+    }
+    return parser_current(parser).line > parser_previous(parser).end_line
+}
+
+func parser_skip_separators(parser: *ParserState) -> void {
+    while (parser_at(parser, lexer.TokenKind.SEMICOLON)) {
+        parser_advance(parser)
+    }
+}
+
+func numeric_digit(value: char) -> int {
+    var digits: char[] = "0123456789".(char[])
+    for (var i: int = 0; i < len(digits); i = i + 1) {
+        if (digits[i] == value) {
+            return i
+        }
+    }
+    return -1
+}
+
+func parse_integer_value(parser: *ParserState, token: lexer.Token) -> int {
+    var chars: char[] = token.value.(char[])
+    var value: int = 0
+    for (var i: int = 0; i < len(chars); i = i + 1) {
+        var digit: int = numeric_digit(chars[i])
+        if (digit < 0 || value > 922337203685477580 || (value == 922337203685477580 && digit > 7)) {
+            parser_fail(parser, "integer literal is outside the supported range", token)
+            return 0
+        }
+        value = value * 10 + digit
+    }
+    return value
+}
+
+func parse_float_value(parser: *ParserState, token: lexer.Token) -> float {
+    var chars: char[] = token.value.(char[])
+    var value: float = 0.0
+    var fraction: float = 0.1
+    var after_decimal: bool = false
+    var exponent: int = 0
+    var exponent_negative: bool = false
+    var in_exponent: bool = false
+    var exponent_sign_seen: bool = false
+    for (var i: int = 0; i < len(chars); i = i + 1) {
+        var current: char = chars[i]
+        if (current == 'e' || current == 'E') {
+            in_exponent = true
+            continue
+        }
+        if (in_exponent && !exponent_sign_seen && (current == '+' || current == '-')) {
+            exponent_negative = current == '-'
+            exponent_sign_seen = true
+            continue
+        }
+        if (current == '.') {
+            after_decimal = true
+            continue
+        }
+        var digit: int = numeric_digit(current)
+        if (digit < 0) {
+            parser_fail(parser, "invalid float literal", token)
+            return 0.0
+        }
+        if (in_exponent) {
+            if (exponent > 308) {
+                parser_fail(parser, "float exponent is outside the supported range", token)
+                return 0.0
+            }
+            exponent = exponent * 10 + digit
+        } else if (after_decimal) {
+            value = value + digit * fraction
+            fraction = fraction / 10.0
+        } else {
+            value = value * 10.0 + digit
+        }
+    }
+    if (exponent > 308) {
+        parser_fail(parser, "float exponent is outside the supported range", token)
+        return 0.0
+    }
+    for (var i: int = 0; i < exponent; i = i + 1) {
+        if (exponent_negative) {
+            value = value / 10.0
+        } else {
+            value = value * 10.0
+        }
+    }
+    return value
+}
+
+func parser_parse_type(parser: *ParserState) -> Type {
+    var start: lexer.Token = parser_current(parser)
+    if (parser_at(parser, lexer.TokenKind.STAR)) {
+        parser_advance(parser)
+        var element: Type = parser_parse_type(parser)
+        var element_pointer: *Type = new(Type);
+        *element_pointer = element;
+        return Type.Pointer{
+            element: element_pointer
+            span: span_between(start, parser_previous(parser))
+        }
+    }
+
+    if (parser_current(parser).type == lexer.TokenKind.IDENT && parser_current(parser).value == "map") {
+        parser_advance(parser)
+        if (parser_at(parser, lexer.TokenKind.LBRACKET)) {
+            parser_advance(parser)
+            var key_type: Type = parser_parse_type(parser)
+            parser_expect(parser, lexer.TokenKind.RBRACKET, "']' after the map key type")
+            var value_type: Type = parser_parse_type(parser)
+            var key_pointer: *Type = new(Type);
+            var value_pointer: *Type = new(Type);
+            *key_pointer = key_type;
+            *value_pointer = value_type;
+            return Type.Map{
+                key: key_pointer
+                value: value_pointer
+                span: span_between(start, parser_previous(parser))
+            }
+        }
+        var map_name: Type = Type.Named{
+            name: "map"
+            span: span_between(start, parser_previous(parser))
+        }
+        return map_name
+    }
+
+    var token: lexer.Token = parser_current(parser)
+    var valid: bool = token.type == lexer.TokenKind.IDENT
+    valid = valid || token.type == lexer.TokenKind.INT
+    valid = valid || token.type == lexer.TokenKind.FLOAT
+    valid = valid || token.type == lexer.TokenKind.BOOL
+    valid = valid || token.type == lexer.TokenKind.CHAR
+    valid = valid || token.type == lexer.TokenKind.STRING
+    valid = valid || token.type == lexer.TokenKind.ERROR
+    valid = valid || token.type == lexer.TokenKind.VOID
+    if (!valid) {
+        parser_fail(parser, "expected a type name", token)
+        return Type.Named{ name: "" span: empty_span() }
+    }
+    parser_advance(parser)
+    var type_name: string = token.value
+    while (parser_at(parser, lexer.TokenKind.DOT)) {
+        parser_advance(parser)
+        var component: lexer.Token = parser_expect(parser, lexer.TokenKind.IDENT, "a qualified type name")
+        type_name = type_name + "." + component.value
+    }
+    var result: Type = Type.Named{
+        name: type_name
+        span: span_between(start, parser_previous(parser))
+    }
+    while (parser_at(parser, lexer.TokenKind.LBRACKET)) {
+        parser_advance(parser)
+        parser_expect(parser, lexer.TokenKind.RBRACKET, "']' in an array type")
+        var element_pointer: *Type = new(Type);
+        *element_pointer = result;
+        result = Type.Array{
+            element: element_pointer
+            span: span_between(start, parser_previous(parser))
+        }
+    }
+    return result
+}
+
+func parser_binary_precedence(kind: lexer.TokenKind) -> int {
+    if (kind == lexer.TokenKind.OR || kind == lexer.TokenKind.LOGICAL_OR) {
+        return 1
+    }
+    if (kind == lexer.TokenKind.AND || kind == lexer.TokenKind.LOGICAL_AND) {
+        return 2
+    }
+    if (kind == lexer.TokenKind.EQUAL || kind == lexer.TokenKind.NOT_EQUAL) {
+        return 3
+    }
+    if (
+        kind == lexer.TokenKind.LESS
+        || kind == lexer.TokenKind.LESS_EQUAL
+        || kind == lexer.TokenKind.GREATER
+        || kind == lexer.TokenKind.GREATER_EQUAL
+    ) {
+        return 4
+    }
+    if (kind == lexer.TokenKind.PLUS || kind == lexer.TokenKind.MINUS) {
+        return 5
+    }
+    if (
+        kind == lexer.TokenKind.STAR
+        || kind == lexer.TokenKind.SLASH
+        || kind == lexer.TokenKind.PERCENT
+    ) {
+        return 6
+    }
+    return 0
+}
+
+func parser_binary_operator(kind: lexer.TokenKind) -> BinaryOperator {
+    if (kind == lexer.TokenKind.MINUS) { return BinaryOperator.SUBTRACT }
+    if (kind == lexer.TokenKind.STAR) { return BinaryOperator.MULTIPLY }
+    if (kind == lexer.TokenKind.SLASH) { return BinaryOperator.DIVIDE }
+    if (kind == lexer.TokenKind.PERCENT) { return BinaryOperator.REMAINDER }
+    if (kind == lexer.TokenKind.EQUAL) { return BinaryOperator.EQUAL }
+    if (kind == lexer.TokenKind.NOT_EQUAL) { return BinaryOperator.NOT_EQUAL }
+    if (kind == lexer.TokenKind.LESS) { return BinaryOperator.LESS }
+    if (kind == lexer.TokenKind.LESS_EQUAL) { return BinaryOperator.LESS_EQUAL }
+    if (kind == lexer.TokenKind.GREATER) { return BinaryOperator.GREATER }
+    if (kind == lexer.TokenKind.GREATER_EQUAL) { return BinaryOperator.GREATER_EQUAL }
+    if (kind == lexer.TokenKind.AND || kind == lexer.TokenKind.LOGICAL_AND) {
+        return BinaryOperator.AND
+    }
+    if (kind == lexer.TokenKind.OR || kind == lexer.TokenKind.LOGICAL_OR) {
+        return BinaryOperator.OR
+    }
+    return BinaryOperator.ADD
+}
+
+func parser_parse_expression(parser: *ParserState, minimum: int) -> Expr {
+    var left: Expr = parser_parse_prefix(parser)
+    while (!parser.failed) {
+        if (parser_has_line_break(parser)) {
+            break
+        }
+        var precedence: int = parser_binary_precedence(parser_current(parser).type)
+        if (precedence < minimum || precedence == 0) {
+            break
+        }
+        var operator_token: lexer.Token = parser_advance(parser)
+        var right: Expr = parser_parse_expression(parser, precedence + 1)
+        var left_pointer: *Expr = new(Expr)
+        var right_pointer: *Expr = new(Expr);
+        *left_pointer = left;
+        *right_pointer = right;
+        left = Expr.Binary{
+            operator: parser_binary_operator(operator_token.type)
+            left: left_pointer
+            right: right_pointer
+            span: span_between(expression_start(left), parser_previous(parser))
+        }
+    }
+    return left
+}
+
+func parser_parse_prefix(parser: *ParserState) -> Expr {
+    var token: lexer.Token = parser_current(parser)
+    if (
+        token.type == lexer.TokenKind.MINUS
+        || token.type == lexer.TokenKind.BANG
+        || token.type == lexer.TokenKind.NOT
+        || token.type == lexer.TokenKind.STAR
+    ) {
+        parser_advance(parser)
+        var operand: Expr = parser_parse_prefix(parser)
+        var operand_pointer: *Expr = new(Expr);
+        *operand_pointer = operand;
+        var operator: UnaryOperator = UnaryOperator.NEGATE
+        if (token.type == lexer.TokenKind.BANG || token.type == lexer.TokenKind.NOT) {
+            operator = UnaryOperator.NOT
+        } else if (token.type == lexer.TokenKind.STAR) {
+            operator = UnaryOperator.DEREFERENCE
+        }
+        return Expr.Unary{
+            operator: operator
+            operand: operand_pointer
+            span: span_between(token, parser_previous(parser))
+        }
+    }
+    return parser_parse_postfix(parser_parse_primary(parser), parser)
+}
+
+func parser_parse_postfix(expression: Expr, parser: *ParserState) -> Expr {
+    var result: Expr = expression
+    while (!parser.failed) {
+        if (parser_has_line_break(parser)) {
+            break
+        }
+        if (parser_at(parser, lexer.TokenKind.LPAREN)) {
+            parser_advance(parser)
+            var arguments: Expr[] = {}
+            if (!parser_at(parser, lexer.TokenKind.RPAREN)) {
+                arguments.append(parser_parse_expression(parser, 1))
+                while (parser_at(parser, lexer.TokenKind.COMMA)) {
+                    parser_advance(parser)
+                    arguments.append(parser_parse_expression(parser, 1))
+                }
+            }
+            parser_expect(parser, lexer.TokenKind.RPAREN, "')' after arguments")
+            var callee_pointer: *Expr = new(Expr);
+            *callee_pointer = result;
+            result = Expr.Call{
+                callee: callee_pointer
+                arguments: arguments
+                span: span_between(expression_start(result), parser_previous(parser))
+            }
+        } else if (parser_at(parser, lexer.TokenKind.LBRACKET)) {
+            parser_advance(parser)
+            var index: Expr = parser_parse_expression(parser, 1)
+            parser_expect(parser, lexer.TokenKind.RBRACKET, "']' after the index")
+            var target_pointer: *Expr = new(Expr);
+            var index_pointer: *Expr = new(Expr);
+            *target_pointer = result;
+            *index_pointer = index;
+            result = Expr.Index{
+                target: target_pointer
+                index: index_pointer
+                span: span_between(expression_start(result), parser_previous(parser))
+            }
+        } else if (parser_at(parser, lexer.TokenKind.DOT)) {
+            parser_advance(parser)
+            if (parser_at(parser, lexer.TokenKind.LPAREN)) {
+                parser_advance(parser)
+                var assertion_type: Type = parser_parse_type(parser)
+                parser_expect(parser, lexer.TokenKind.RPAREN, "')' after the asserted type")
+                result = Expr.TypeAssert{
+                    target: expression_pointer(result)
+                    type: assertion_type
+                    span: span_between(expression_start(result), parser_previous(parser))
+                }
+            } else {
+                var name: lexer.Token = parser_expect(parser, lexer.TokenKind.IDENT, "a field name")
+                if (parser_at(parser, lexer.TokenKind.LBRACE)) {
+                    result = parser_parse_struct_literal_path(
+                        expression_start(result),
+                        expression_name(result) + "." + name.value,
+                        parser
+                    )
+                } else {
+                    result = Expr.Field{
+                        target: expression_pointer(result)
+                        name: name.value
+                        span: span_between(expression_start(result), name)
+                    }
+                }
+            }
+        } else {
+            break
+        }
+    }
+    return result
+}
+
+func expression_start(expression: Expr) -> lexer.Token {
+    var start: lexer.Token = lexer.Token{
+        type: lexer.TokenKind.IDENT
+        value: ""
+        line: 1
+        column: 1
+        end_line: 1
+        end_column: 1
+    }
+    match expression {
+        Expr.Name{ name: name, span: node_span } -> { start = token_from_span(node_span) }
+        Expr.Integer{ value: value, span: node_span } -> { start = token_from_span(node_span) }
+        Expr.Float{ value: value, span: node_span } -> { start = token_from_span(node_span) }
+        Expr.String{ value: value, span: node_span } -> { start = token_from_span(node_span) }
+        Expr.RawString{ value: value, span: node_span } -> { start = token_from_span(node_span) }
+        Expr.Character{ value: value, span: node_span } -> { start = token_from_span(node_span) }
+        Expr.Boolean{ value: value, span: node_span } -> { start = token_from_span(node_span) }
+        Expr.Nil{ span: node_span } -> { start = token_from_span(node_span) }
+        Expr.Array{ elements: elements, span: node_span } -> { start = token_from_span(node_span) }
+        Expr.Map{ type: map_type, entries: entries, span: node_span } -> { start = token_from_span(node_span) }
+        Expr.Structure{ type_name: type_name, fields: fields, span: node_span } -> { start = token_from_span(node_span) }
+        Expr.New{ type: allocated_type, span: node_span } -> { start = token_from_span(node_span) }
+        Expr.Unary{ operator: operator, operand: operand, span: node_span } -> { start = token_from_span(node_span) }
+        Expr.Binary{ operator: operator, left: left, right: right, span: node_span } -> { start = token_from_span(node_span) }
+        Expr.Call{ callee: callee, arguments: arguments, span: node_span } -> { start = token_from_span(node_span) }
+        Expr.Index{ target: target, index: index, span: node_span } -> { start = token_from_span(node_span) }
+        Expr.Field{ target: target, name: name, span: node_span } -> { start = token_from_span(node_span) }
+        Expr.TypeAssert{ target: target, type: type, span: node_span } -> { start = token_from_span(node_span) }
+    }
+    return start
+}
+
+func token_from_span(span: Span) -> lexer.Token {
+    return lexer.Token{
+        type: lexer.TokenKind.IDENT
+        value: ""
+        line: span.line
+        column: span.column
+        end_line: span.end_line
+        end_column: span.end_column
+    }
+}
+
+func expression_pointer(expression: Expr) -> *Expr {
+    var pointer: *Expr = new(Expr);
+    *pointer = expression;
+    return pointer
+}
+
+func parser_parse_primary(parser: *ParserState) -> Expr {
+    var token: lexer.Token = parser_current(parser)
+    if (
+        token.type == lexer.TokenKind.IDENT
+        && token.value == "new"
+        && parser.position + 1 < len(parser.tokens)
+        && parser.tokens[parser.position + 1].type == lexer.TokenKind.LPAREN
+    ) {
+        parser_advance(parser)
+        parser_advance(parser)
+        var allocated_type: Type = parser_parse_type(parser)
+        parser_expect(parser, lexer.TokenKind.RPAREN, "')' after the allocated type")
+        return Expr.New{
+            type: allocated_type
+            span: span_between(token, parser_previous(parser))
+        }
+    }
+    if (
+        token.type == lexer.TokenKind.IDENT
+        && token.value == "map"
+        && parser.position + 1 < len(parser.tokens)
+        && parser.tokens[parser.position + 1].type == lexer.TokenKind.LBRACKET
+    ) {
+        var map_type: Type = parser_parse_type(parser)
+        parser_expect(parser, lexer.TokenKind.LBRACE, "'{' before map entries")
+        var entries: MapEntry[] = {}
+        while (!parser.failed && !parser_at(parser, lexer.TokenKind.RBRACE)) {
+            var key: Expr = parser_parse_expression(parser, 1)
+            parser_expect(parser, lexer.TokenKind.COLON, "':' between a map key and value")
+            var value: Expr = parser_parse_expression(parser, 1)
+            entries.append(MapEntry{
+                key: key
+                value: value
+                span: span_between(expression_start(key), parser_previous(parser))
+            })
+            if (parser_at(parser, lexer.TokenKind.COMMA) || parser_at(parser, lexer.TokenKind.SEMICOLON)) {
+                parser_advance(parser)
+            } else if (!parser_at(parser, lexer.TokenKind.RBRACE) && !parser_has_line_break(parser)) {
+                parser_fail(parser, "expected a comma or newline between map entries", parser_current(parser))
+            }
+        }
+        parser_expect(parser, lexer.TokenKind.RBRACE, "'}' after map entries")
+        return Expr.Map{
+            type: map_type
+            entries: entries
+            span: span_between(token, parser_previous(parser))
+        }
+    }
+    if (token.type == lexer.TokenKind.INT_LIT) {
+        parser_advance(parser)
+        return Expr.Integer{
+            value: parse_integer_value(parser, token)
+            span: span_between(token, token)
+        }
+    }
+    if (token.type == lexer.TokenKind.FLOAT_LIT) {
+        parser_advance(parser)
+        return Expr.Float{
+            value: parse_float_value(parser, token)
+            span: span_between(token, token)
+        }
+    }
+    if (token.type == lexer.TokenKind.STRING_LIT) {
+        parser_advance(parser)
+        return Expr.String{ value: token.value span: span_between(token, token) }
+    }
+    if (token.type == lexer.TokenKind.RAW_STRING_LIT) {
+        parser_advance(parser)
+        return Expr.RawString{ value: token.value span: span_between(token, token) }
+    }
+    if (token.type == lexer.TokenKind.CHAR_LIT) {
+        parser_advance(parser)
+        var characters: char[] = token.value.(char[])
+        if (len(characters) != 1) {
+            parser_fail(parser, "character token must contain one character", token)
+            return Expr.Character{ value: '\0' span: span_between(token, token) }
+        }
+        return Expr.Character{ value: characters[0] span: span_between(token, token) }
+    }
+    if (token.type == lexer.TokenKind.TRUE || token.type == lexer.TokenKind.FALSE) {
+        parser_advance(parser)
+        return Expr.Boolean{
+            value: token.type == lexer.TokenKind.TRUE
+            span: span_between(token, token)
+        }
+    }
+    if (token.type == lexer.TokenKind.NIL) {
+        parser_advance(parser)
+        return Expr.Nil{ span: span_between(token, token) }
+    }
+    if (token.type == lexer.TokenKind.IDENT) {
+        parser_advance(parser)
+        var name: Expr = Expr.Name{ name: token.value span: span_between(token, token) }
+        if (parser.allow_struct_literal && parser_at(parser, lexer.TokenKind.LBRACE)) {
+            return parser_parse_struct_literal_path(token, token.value, parser)
+        }
+        return name
+    }
+    if (token.type == lexer.TokenKind.LPAREN) {
+        parser_advance(parser)
+        var expression: Expr = parser_parse_expression(parser, 1)
+        parser_expect(parser, lexer.TokenKind.RPAREN, "')' after expression")
+        return expression
+    }
+    if (token.type == lexer.TokenKind.LBRACKET || token.type == lexer.TokenKind.LBRACE) {
+        return parser_parse_array(parser)
+    }
+    parser_fail(parser, "expected an expression", token)
+    return Expr.Nil{ span: span_between(token, token) }
+}
+
+func parser_parse_struct_literal_path(
+    start: lexer.Token,
+    type_name: string,
+    parser: *ParserState
+) -> Expr {
+    parser_expect(parser, lexer.TokenKind.LBRACE, "'{' before structure fields")
+    var fields: FieldInit[] = {}
+    while (!parser.failed && !parser_at(parser, lexer.TokenKind.RBRACE)) {
+        var field_name: lexer.Token = parser_expect(parser, lexer.TokenKind.IDENT, "a structure field name")
+        parser_expect(parser, lexer.TokenKind.COLON, "':' after the field name")
+        var value: Expr = parser_parse_expression(parser, 1)
+        fields.append(FieldInit{
+            name: field_name.value
+            value: value
+            span: span_between(field_name, parser_previous(parser))
+        })
+        if (parser_at(parser, lexer.TokenKind.COMMA) || parser_at(parser, lexer.TokenKind.SEMICOLON)) {
+            parser_advance(parser)
+        } else if (!parser_at(parser, lexer.TokenKind.RBRACE) && !parser_has_line_break(parser)) {
+            parser_fail(parser, "expected a comma or newline between structure fields", parser_current(parser))
+        }
+    }
+    parser_expect(parser, lexer.TokenKind.RBRACE, "'}' after structure fields")
+    return Expr.Structure{
+        type_name: type_name
+        fields: fields
+        span: span_between(start, parser_previous(parser))
+    }
+}
+
+func parser_parse_array(parser: *ParserState) -> Expr {
+    var opening: lexer.Token = parser_advance(parser)
+    var closing_kind: lexer.TokenKind = lexer.TokenKind.RBRACKET
+    if (opening.type == lexer.TokenKind.LBRACE) {
+        closing_kind = lexer.TokenKind.RBRACE
+    }
+    var elements: Expr[] = {}
+    while (!parser.failed && !parser_at(parser, closing_kind)) {
+        elements.append(parser_parse_expression(parser, 1))
+        if (parser_at(parser, lexer.TokenKind.COMMA) || parser_at(parser, lexer.TokenKind.SEMICOLON)) {
+            parser_advance(parser)
+        } else if (!parser_at(parser, closing_kind) && !parser_has_line_break(parser)) {
+            parser_fail(parser, "expected a comma or newline between array elements", parser_current(parser))
+        }
+    }
+    parser_expect(parser, closing_kind, "the closing array delimiter")
+    return Expr.Array{ elements: elements span: span_between(opening, parser_previous(parser)) }
+}
+
+public func Parse(tokens: lexer.Token[]) -> ParseResult {
+    if (len(tokens) == 0) {
+        var missing: Span = empty_span()
+        return ParseResult{
+            success: false
+            program: Program{ package_name: "" items: {} span: missing }
+            message: "token stream is empty"
+            span: missing
+        }
+    }
+    for (var i: int = 0; i < len(tokens); i = i + 1) {
+        if (tokens[i].type == lexer.TokenKind.ILLEGAL) {
+            var error_span: Span = span_between(tokens[i], tokens[i])
+            return ParseResult{
+                success: false
+                program: Program{ package_name: "" items: {} span: error_span }
+                message: tokens[i].value
+                span: error_span
+            }
+        }
+    }
+    var input: lexer.Token[] = tokens
+    if (input[len(input) - 1].type != lexer.TokenKind.EOF) {
+        var last: lexer.Token = input[len(input) - 1]
+        input.append(lexer.Token{
+            type: lexer.TokenKind.EOF
+            value: ""
+            line: last.end_line
+            column: last.end_column
+            end_line: last.end_line
+            end_column: last.end_column
+        })
+    }
+    var state: *ParserState = new(ParserState);
+    *state = ParserState{
+        tokens: input
+        position: 0
+        failed: false
+        message: ""
+        error_span: empty_span()
+        allow_struct_literal: true
+    }
+    var program: Program = parser_parse_program(state)
+    if (state.failed) {
+        return ParseResult{
+            success: false
+            program: Program{ package_name: "" items: {} span: state.error_span }
+            message: state.message
+            span: state.error_span
+        }
+    }
+    return ParseResult{
+        success: true
+        program: program
+        message: ""
+        span: program.span
+    }
+}
+
+func parser_parse_program(parser: *ParserState) -> Program {
+    var package_token: lexer.Token = parser_expect(parser, lexer.TokenKind.PACKAGE, "'package' at the start of the file")
+    var package_name: lexer.Token = parser_expect(parser, lexer.TokenKind.IDENT, "a package name")
+    var items: Declaration[] = {}
+    parser_skip_separators(parser)
+    var seen_declaration: bool = false
+    while (!parser.failed && !parser_at(parser, lexer.TokenKind.EOF)) {
+        if (parser_at(parser, lexer.TokenKind.IMPORT)) {
+            if (seen_declaration) {
+                parser_fail(parser, "imports must appear before declarations", parser_current(parser))
+            } else {
+                items = parser_parse_imports(parser)
+            }
+        } else {
+            seen_declaration = true
+            items.append(parser_parse_declaration(parser))
+        }
+        if (parser_at(parser, lexer.TokenKind.SEMICOLON)) {
+            parser_skip_separators(parser)
+        } else if (!parser_at(parser, lexer.TokenKind.EOF) && !parser_has_line_break(parser)) {
+            parser_fail(parser, "expected a newline or semicolon between declarations", parser_current(parser))
+        }
+    }
+    var finish: lexer.Token = parser_current(parser)
+    return Program{
+        package_name: package_name.value
+        items: items
+        span: span_between(package_token, finish)
+    }
+}
+
+func parser_parse_imports(parser: *ParserState) -> Declaration[] {
+    var items: Declaration[] = {}
+    parser_advance(parser)
+    if (parser_at(parser, lexer.TokenKind.LBRACE)) {
+        parser_advance(parser)
+        while (!parser.failed && !parser_at(parser, lexer.TokenKind.RBRACE)) {
+            items.append(Declaration.Import{ declaration: parser_parse_import(parser) })
+            if (parser_at(parser, lexer.TokenKind.COMMA) || parser_at(parser, lexer.TokenKind.SEMICOLON)) {
+                parser_advance(parser)
+            } else if (!parser_at(parser, lexer.TokenKind.RBRACE) && !parser_has_line_break(parser)) {
+                parser_fail(parser, "expected a comma or newline between imports", parser_current(parser))
+            }
+        }
+        parser_expect(parser, lexer.TokenKind.RBRACE, "'}' after imports")
+    } else {
+        items.append(Declaration.Import{ declaration: parser_parse_import(parser) })
+    }
+    return items
+}
+
+func parser_parse_import(parser: *ParserState) -> ImportDecl {
+    var path: lexer.Token = parser_expect(parser, lexer.TokenKind.STRING_LIT, "an import path string")
+    var alias: string = ""
+    if (parser_at(parser, lexer.TokenKind.AS)) {
+        parser_advance(parser)
+        alias = parser_expect(parser, lexer.TokenKind.IDENT, "an import alias").value
+    }
+    return ImportDecl{
+        path: path.value
+        alias: alias
+        span: span_between(path, parser_previous(parser))
+    }
+}
+
+func parser_parse_declaration(parser: *ParserState) -> Declaration {
+    var visibility: Visibility = Visibility.PRIVATE
+    if (parser_at(parser, lexer.TokenKind.PUBLIC)) {
+        parser_advance(parser)
+        visibility = Visibility.PUBLIC
+    }
+    if (parser_at(parser, lexer.TokenKind.VAR)) {
+        return Declaration.Variable{
+            declaration: parser_parse_variable(parser, visibility)
+        }
+    }
+    if (parser_at(parser, lexer.TokenKind.STRUCT)) {
+        return Declaration.Structure{ declaration: parser_parse_struct(parser, visibility) }
+    }
+    if (parser_at(parser, lexer.TokenKind.ENUM)) {
+        return Declaration.Enumeration{ declaration: parser_parse_enum(parser, visibility) }
+    }
+    var is_extern: bool = false
+    if (parser_at(parser, lexer.TokenKind.EXTERN)) {
+        parser_advance(parser)
+        is_extern = true
+    }
+    if (parser_at(parser, lexer.TokenKind.FUNC)) {
+        return Declaration.Function{
+            declaration: parser_parse_function(parser, visibility, is_extern)
+        }
+    }
+    parser_fail(parser, "expected a declaration", parser_current(parser))
+    return Declaration.Variable{
+        declaration: VarDecl{
+            name: ""
+            type: Type.Named{ name: "" span: empty_span() }
+            initializer: nil
+            visibility: visibility
+            span: empty_span()
+        }
+    }
+}
+
+func parser_parse_variable(parser: *ParserState, visibility: Visibility) -> VarDecl {
+    var start: lexer.Token = parser_expect(parser, lexer.TokenKind.VAR, "'var'")
+    var name: lexer.Token = parser_expect(parser, lexer.TokenKind.IDENT, "a variable name")
+    parser_expect(parser, lexer.TokenKind.COLON, "':' after the variable name")
+    var type: Type = parser_parse_type(parser)
+    parser_expect(parser, lexer.TokenKind.ASSIGN, "'=' before the initializer")
+    var initializer_value: Expr = parser_parse_expression(parser, 1)
+    var initializer: *Expr = new(Expr);
+    *initializer = initializer_value;
+    return VarDecl{
+        name: name.value
+        type: type
+        initializer: initializer
+        visibility: visibility
+        span: span_between(start, parser_previous(parser))
+    }
+}
+
+func parser_parse_struct(parser: *ParserState, visibility: Visibility) -> StructDecl {
+    var start: lexer.Token = parser_expect(parser, lexer.TokenKind.STRUCT, "'struct'")
+    var name: lexer.Token = parser_expect(parser, lexer.TokenKind.IDENT, "a structure name")
+    parser_expect(parser, lexer.TokenKind.LBRACE, "'{' before structure fields")
+    var fields: StructField[] = {}
+    while (!parser.failed && !parser_at(parser, lexer.TokenKind.RBRACE)) {
+        var field_name: lexer.Token = parser_expect(parser, lexer.TokenKind.IDENT, "a structure field name")
+        parser_expect(parser, lexer.TokenKind.COLON, "':' after the field name")
+        var field_type: Type = parser_parse_type(parser)
+        var default_value: *Expr = nil
+        if (parser_at(parser, lexer.TokenKind.ASSIGN)) {
+            parser_advance(parser)
+            default_value = expression_pointer(parser_parse_expression(parser, 1))
+        }
+        fields.append(StructField{
+            name: field_name.value
+            type: field_type
+            default_value: default_value
+            span: span_between(field_name, parser_previous(parser))
+        })
+        if (parser_at(parser, lexer.TokenKind.COMMA) || parser_at(parser, lexer.TokenKind.SEMICOLON)) {
+            parser_advance(parser)
+        } else if (!parser_at(parser, lexer.TokenKind.RBRACE) && !parser_has_line_break(parser)) {
+            parser_fail(parser, "expected a comma or newline between structure fields", parser_current(parser))
+        }
+    }
+    parser_expect(parser, lexer.TokenKind.RBRACE, "'}' after structure fields")
+    return StructDecl{
+        name: name.value
+        fields: fields
+        visibility: visibility
+        span: span_between(start, parser_previous(parser))
+    }
+}
+
+func parser_parse_enum(parser: *ParserState, visibility: Visibility) -> EnumDecl {
+    var start: lexer.Token = parser_expect(parser, lexer.TokenKind.ENUM, "'enum'")
+    var name: lexer.Token = parser_expect(parser, lexer.TokenKind.IDENT, "an enum name")
+    parser_expect(parser, lexer.TokenKind.LBRACE, "'{' before enum variants")
+    var variants: EnumVariant[] = {}
+    while (!parser.failed && !parser_at(parser, lexer.TokenKind.RBRACE)) {
+        var variant_name: lexer.Token = parser_expect(parser, lexer.TokenKind.IDENT, "an enum variant name")
+        var fields: EnumPayloadField[] = {}
+        if (parser_at(parser, lexer.TokenKind.LPAREN)) {
+            parser_advance(parser)
+            if (!parser_at(parser, lexer.TokenKind.RPAREN)) {
+                while (!parser.failed) {
+                    var field_name: lexer.Token = parser_expect(parser, lexer.TokenKind.IDENT, "a payload field name")
+                    parser_expect(parser, lexer.TokenKind.COLON, "':' after the payload field name")
+                    var field_type: Type = parser_parse_type(parser)
+                    fields.append(EnumPayloadField{
+                        name: field_name.value
+                        type: field_type
+                        span: span_between(field_name, parser_previous(parser))
+                    })
+                    if (parser_at(parser, lexer.TokenKind.COMMA)) {
+                        parser_advance(parser)
+                    } else {
+                        break
+                    }
+                }
+            }
+            parser_expect(parser, lexer.TokenKind.RPAREN, "')' after enum payload fields")
+        }
+        variants.append(EnumVariant{
+            name: variant_name.value
+            fields: fields
+            span: span_between(variant_name, parser_previous(parser))
+        })
+        if (parser_at(parser, lexer.TokenKind.COMMA) || parser_at(parser, lexer.TokenKind.SEMICOLON)) {
+            parser_advance(parser)
+        } else if (!parser_at(parser, lexer.TokenKind.RBRACE) && !parser_has_line_break(parser)) {
+            parser_fail(parser, "expected a comma or newline between enum variants", parser_current(parser))
+        }
+    }
+    parser_expect(parser, lexer.TokenKind.RBRACE, "'}' after enum variants")
+    return EnumDecl{
+        name: name.value
+        variants: variants
+        visibility: visibility
+        span: span_between(start, parser_previous(parser))
+    }
+}
+
+func parser_parse_function(
+    parser: *ParserState,
+    visibility: Visibility,
+    is_extern: bool
+) -> FuncDecl {
+    var start: lexer.Token = parser_expect(parser, lexer.TokenKind.FUNC, "'func'")
+    var name: lexer.Token = parser_expect(parser, lexer.TokenKind.IDENT, "a function name")
+    parser_expect(parser, lexer.TokenKind.LPAREN, "'(' after the function name")
+    var parameters: Parameter[] = {}
+    if (!parser_at(parser, lexer.TokenKind.RPAREN)) {
+        while (!parser.failed) {
+            var parameter_name: lexer.Token = parser_expect(parser, lexer.TokenKind.IDENT, "a parameter name")
+            parser_expect(parser, lexer.TokenKind.COLON, "':' after the parameter name")
+            var parameter_type: Type = parser_parse_type(parser)
+            var variadic: bool = false
+            if (parser_at(parser, lexer.TokenKind.ELLIPSIS)) {
+                parser_advance(parser)
+                variadic = true
+            }
+            parameters.append(Parameter{
+                name: parameter_name.value
+                type: parameter_type
+                variadic: variadic
+                span: span_between(parameter_name, parser_previous(parser))
+            })
+            if (parser_at(parser, lexer.TokenKind.COMMA)) {
+                parser_advance(parser)
+            } else {
+                break
+            }
+        }
+    }
+    parser_expect(parser, lexer.TokenKind.RPAREN, "')' after function parameters")
+    parser_expect(parser, lexer.TokenKind.ARROW, "'->' before the return type")
+    var return_types: Type[] = {}
+    return_types.append(parser_parse_type(parser))
+    while (parser_at(parser, lexer.TokenKind.COMMA)) {
+        parser_advance(parser)
+        return_types.append(parser_parse_type(parser))
+    }
+    var is_owned: bool = false
+    if (parser_at(parser, lexer.TokenKind.OWNED)) {
+        parser_advance(parser)
+        is_owned = true
+    }
+    var c_name: string = ""
+    var library: string = ""
+    while (!parser.failed && (parser_at(parser, lexer.TokenKind.AS) || parser_at(parser, lexer.TokenKind.FROM))) {
+        if (parser_at(parser, lexer.TokenKind.AS)) {
+            parser_advance(parser)
+            if (c_name != "") {
+                parser_fail(parser, "C symbol is specified more than once", parser_previous(parser))
+            }
+            c_name = parser_expect(parser, lexer.TokenKind.STRING_LIT, "a C symbol string").value
+        } else {
+            parser_advance(parser)
+            if (library != "") {
+                parser_fail(parser, "shared library is specified more than once", parser_previous(parser))
+            }
+            library = parser_expect(parser, lexer.TokenKind.STRING_LIT, "a shared-library path").value
+        }
+    }
+    if (!is_extern && (c_name != "" || library != "")) {
+        parser_fail(parser, "'as' and 'from' are only valid on extern functions", start)
+    }
+    var body: *Stmt = nil
+    if (!is_extern) {
+        var body_value: Stmt = parser_parse_block(parser)
+        body = new(Stmt);
+        *body = body_value;
+    } else if (parser_at(parser, lexer.TokenKind.SEMICOLON)) {
+        parser_advance(parser)
+    }
+    return FuncDecl{
+        name: name.value
+        parameters: parameters
+        return_types: return_types
+        body: body
+        visibility: visibility
+        is_extern: is_extern
+        is_owned: is_owned
+        c_name: c_name
+        library: library
+        span: span_between(start, parser_previous(parser))
+    }
+}
+
+func parser_parse_block(parser: *ParserState) -> Stmt {
+    var start: lexer.Token = parser_expect(parser, lexer.TokenKind.LBRACE, "'{' before a block")
+    var statements: Stmt[] = {}
+    while (!parser.failed && !parser_at(parser, lexer.TokenKind.RBRACE)) {
+        if (parser_at(parser, lexer.TokenKind.EOF)) {
+            parser_fail(parser, "unterminated block: expected '}'", parser_current(parser))
+            break
+        }
+        var old_position: int = parser.position
+        statements.append(parser_parse_statement(parser))
+        if (parser_at(parser, lexer.TokenKind.SEMICOLON)) {
+            parser_skip_separators(parser)
+        } else if (
+            !parser_at(parser, lexer.TokenKind.RBRACE)
+            && !parser.failed
+            && !parser_has_line_break(parser)
+        ) {
+            parser_fail(parser, "expected a newline or semicolon between statements", parser_current(parser))
+        }
+        if (parser.position == old_position && !parser.failed) {
+            parser_fail(parser, "parser made no progress while reading a block", parser_current(parser))
+        }
+    }
+    parser_expect(parser, lexer.TokenKind.RBRACE, "'}' after a block")
+    return Stmt.Block{ statements: statements span: span_between(start, parser_previous(parser)) }
+}
+
+func parser_parse_statement(parser: *ParserState) -> Stmt {
+    var token: lexer.Token = parser_current(parser)
+    if (token.type == lexer.TokenKind.VAR) {
+        var declaration: VarDecl = parser_parse_variable(parser, Visibility.PRIVATE)
+        return Stmt.Variable{ declaration: declaration span: declaration.span }
+    }
+    if (token.type == lexer.TokenKind.LBRACE) {
+        return parser_parse_block(parser)
+    }
+    if (token.type == lexer.TokenKind.IF) {
+        return parser_parse_if(parser)
+    }
+    if (token.type == lexer.TokenKind.WHILE) {
+        return parser_parse_while(parser)
+    }
+    if (token.type == lexer.TokenKind.FOR) {
+        return parser_parse_for(parser)
+    }
+    if (token.type == lexer.TokenKind.MATCH) {
+        return parser_parse_match(parser)
+    }
+    if (token.type == lexer.TokenKind.RETURN) {
+        return parser_parse_return(parser)
+    }
+    if (token.type == lexer.TokenKind.BREAK) {
+        parser_advance(parser)
+        return Stmt.Break{ span: span_between(token, token) }
+    }
+    if (token.type == lexer.TokenKind.CONTINUE) {
+        parser_advance(parser)
+        return Stmt.Continue{ span: span_between(token, token) }
+    }
+    if (token.type == lexer.TokenKind.PRINT) {
+        return parser_parse_print(parser)
+    }
+    return parser_parse_assignment_or_expression(parser)
+}
+
+func parser_parse_assignment_or_expression(parser: *ParserState) -> Stmt {
+    var start: lexer.Token = parser_current(parser)
+    var target: Expr = parser_parse_expression(parser, 1)
+    if (parser_at(parser, lexer.TokenKind.ASSIGN)) {
+        parser_advance(parser)
+        var value: Expr = parser_parse_expression(parser, 1)
+        return Stmt.Assignment{
+            target: target
+            value: value
+            span: span_between(start, parser_previous(parser))
+        }
+    }
+    return Stmt.Expression{
+        expression: target
+        span: span_between(start, parser_previous(parser))
+    }
+}
+
+func parser_parse_if(parser: *ParserState) -> Stmt {
+    var start: lexer.Token = parser_expect(parser, lexer.TokenKind.IF, "'if'")
+    parser_expect(parser, lexer.TokenKind.LPAREN, "'(' after 'if'")
+    var condition: Expr = parser_parse_expression(parser, 1)
+    parser_expect(parser, lexer.TokenKind.RPAREN, "')' after the condition")
+    var then_value: Stmt = parser_parse_block(parser)
+    var then_pointer: *Stmt = new(Stmt);
+    *then_pointer = then_value;
+    var else_pointer: *Stmt = nil
+    if (parser_at(parser, lexer.TokenKind.ELSE)) {
+        parser_advance(parser)
+        var empty_statements: Stmt[] = {}
+        var else_value: Stmt = Stmt.Block{
+            statements: empty_statements
+            span: empty_span()
+        }
+        if (parser_at(parser, lexer.TokenKind.IF)) {
+            else_value = parser_parse_if(parser)
+        } else {
+            else_value = parser_parse_block(parser)
+        }
+        else_pointer = new(Stmt);
+        *else_pointer = else_value;
+    }
+    return Stmt.If{
+        condition: condition
+        then_branch: then_pointer
+        else_branch: else_pointer
+        span: span_between(start, parser_previous(parser))
+    }
+}
+
+func parser_parse_while(parser: *ParserState) -> Stmt {
+    var start: lexer.Token = parser_expect(parser, lexer.TokenKind.WHILE, "'while'")
+    parser_expect(parser, lexer.TokenKind.LPAREN, "'(' after 'while'")
+    var condition: Expr = parser_parse_expression(parser, 1)
+    parser_expect(parser, lexer.TokenKind.RPAREN, "')' after the condition")
+    var body_value: Stmt = parser_parse_block(parser)
+    var body: *Stmt = new(Stmt);
+    *body = body_value;
+    return Stmt.While{
+        condition: condition
+        body: body
+        span: span_between(start, parser_previous(parser))
+    }
+}
+
+func parser_parse_for(parser: *ParserState) -> Stmt {
+    var start: lexer.Token = parser_expect(parser, lexer.TokenKind.FOR, "'for'")
+    parser_expect(parser, lexer.TokenKind.LPAREN, "'(' after 'for'")
+    var initializer: *Stmt = nil
+    if (!parser_at(parser, lexer.TokenKind.SEMICOLON)) {
+        var initial: Stmt = Stmt.Expression{
+            expression: Expr.Nil{ span: empty_span() }
+            span: empty_span()
+        }
+        if (parser_at(parser, lexer.TokenKind.VAR)) {
+            var declaration: VarDecl = parser_parse_variable(parser, Visibility.PRIVATE)
+            initial = Stmt.Variable{ declaration: declaration span: declaration.span }
+        } else {
+            initial = parser_parse_assignment_or_expression(parser)
+        }
+        initializer = new(Stmt);
+        *initializer = initial;
+    }
+    parser_expect(parser, lexer.TokenKind.SEMICOLON, "';' after the for initializer")
+    var condition: *Expr = nil
+    if (!parser_at(parser, lexer.TokenKind.SEMICOLON)) {
+        condition = expression_pointer(parser_parse_expression(parser, 1))
+    }
+    parser_expect(parser, lexer.TokenKind.SEMICOLON, "';' after the for condition")
+    var increment: *Stmt = nil
+    if (!parser_at(parser, lexer.TokenKind.RPAREN)) {
+        increment = new(Stmt);
+        *increment = parser_parse_assignment_or_expression(parser);
+    }
+    parser_expect(parser, lexer.TokenKind.RPAREN, "')' after the for clauses")
+    var body_value: Stmt = parser_parse_block(parser)
+    var body: *Stmt = new(Stmt);
+    *body = body_value;
+    return Stmt.For{
+        initializer: initializer
+        condition: condition
+        increment: increment
+        body: body
+        span: span_between(start, parser_previous(parser))
+    }
+}
+
+func parser_parse_match(parser: *ParserState) -> Stmt {
+    var start: lexer.Token = parser_expect(parser, lexer.TokenKind.MATCH, "'match'")
+    var parenthesized: bool = parser_at(parser, lexer.TokenKind.LPAREN)
+    if (parenthesized) {
+        parser_advance(parser)
+    }
+    var previous_struct_mode: bool = parser.allow_struct_literal
+    parser.allow_struct_literal = false
+    var value: Expr = parser_parse_expression(parser, 1)
+    parser.allow_struct_literal = previous_struct_mode
+    if (parenthesized) {
+        parser_expect(parser, lexer.TokenKind.RPAREN, "')' after match value")
+    }
+    parser_expect(parser, lexer.TokenKind.LBRACE, "'{' before match cases")
+    var cases: MatchCase[] = {}
+    while (!parser.failed && !parser_at(parser, lexer.TokenKind.RBRACE)) {
+        var enum_start: lexer.Token = parser_expect(parser, lexer.TokenKind.IDENT, "an enum type in a match case")
+        var enum_type: string = enum_start.value
+        var variant: string = ""
+        var last_component: lexer.Token = enum_start
+        while (parser_at(parser, lexer.TokenKind.DOT)) {
+            parser_advance(parser)
+            last_component = parser_expect(parser, lexer.TokenKind.IDENT, "an enum variant name")
+            if (parser_at(parser, lexer.TokenKind.DOT)) {
+                enum_type = enum_type + "." + last_component.value
+            } else {
+                variant = last_component.value
+                break
+            }
+        }
+        if (variant == "") {
+            parser_fail(parser, "expected '.Variant' in a match case", last_component)
+        }
+        var bindings: PatternBinding[] = {}
+        if (parser_at(parser, lexer.TokenKind.LBRACE)) {
+            parser_advance(parser)
+            while (!parser.failed && !parser_at(parser, lexer.TokenKind.RBRACE)) {
+                var field_name: lexer.Token = parser_expect(parser, lexer.TokenKind.IDENT, "a payload field name")
+                parser_expect(parser, lexer.TokenKind.COLON, "':' after the payload field")
+                var binding_name: lexer.Token = parser_expect(parser, lexer.TokenKind.IDENT, "a pattern binding name")
+                bindings.append(PatternBinding{
+                    field_name: field_name.value
+                    name: binding_name.value
+                    span: span_between(field_name, binding_name)
+                })
+                if (parser_at(parser, lexer.TokenKind.COMMA)) {
+                    parser_advance(parser)
+                } else if (!parser_at(parser, lexer.TokenKind.RBRACE) && !parser_has_line_break(parser)) {
+                    parser_fail(parser, "expected a comma or newline between pattern bindings", parser_current(parser))
+                }
+            }
+            parser_expect(parser, lexer.TokenKind.RBRACE, "'}' after pattern bindings")
+        }
+        parser_expect(parser, lexer.TokenKind.ARROW, "'->' before a match case body")
+        var body_value: Stmt = parser_parse_block(parser)
+        var body: *Stmt = new(Stmt);
+        *body = body_value;
+        cases.append(MatchCase{
+            enum_type: enum_type
+            variant: variant
+            bindings: bindings
+            body: body
+            span: span_between(enum_start, parser_previous(parser))
+        })
+        if (parser_at(parser, lexer.TokenKind.COMMA) || parser_at(parser, lexer.TokenKind.SEMICOLON)) {
+            parser_advance(parser)
+        } else if (!parser_at(parser, lexer.TokenKind.RBRACE) && !parser_has_line_break(parser)) {
+            parser_fail(parser, "expected a newline or semicolon between match cases", parser_current(parser))
+        }
+    }
+    parser_expect(parser, lexer.TokenKind.RBRACE, "'}' after match cases")
+    return Stmt.Match{ value: value cases: cases span: span_between(start, parser_previous(parser)) }
+}
+
+func parser_parse_return(parser: *ParserState) -> Stmt {
+    var start: lexer.Token = parser_expect(parser, lexer.TokenKind.RETURN, "'return'")
+    var values: Expr[] = {}
+    if (
+        !parser_at(parser, lexer.TokenKind.RBRACE)
+        && !parser_at(parser, lexer.TokenKind.EOF)
+        && !parser_at(parser, lexer.TokenKind.SEMICOLON)
+        && !parser_has_line_break(parser)
+    ) {
+        values.append(parser_parse_expression(parser, 1))
+        while (parser_at(parser, lexer.TokenKind.COMMA)) {
+            parser_advance(parser)
+            values.append(parser_parse_expression(parser, 1))
+        }
+    }
+    return Stmt.Return{ values: values span: span_between(start, parser_previous(parser)) }
+}
+
+func parser_parse_print(parser: *ParserState) -> Stmt {
+    var start: lexer.Token = parser_expect(parser, lexer.TokenKind.PRINT, "'print'")
+    parser_expect(parser, lexer.TokenKind.LPAREN, "'(' after 'print'")
+    var arguments: Expr[] = {}
+    if (!parser_at(parser, lexer.TokenKind.RPAREN)) {
+        arguments.append(parser_parse_expression(parser, 1))
+        while (parser_at(parser, lexer.TokenKind.COMMA)) {
+            parser_advance(parser)
+            arguments.append(parser_parse_expression(parser, 1))
+        }
+    }
+    parser_expect(parser, lexer.TokenKind.RPAREN, "')' after print arguments")
+    return Stmt.Print{
+        arguments: arguments
+        span: span_between(start, parser_previous(parser))
+    }
+}
+
+func parser_parse_meta(parser: *ParserState) -> Attribute {
+    var start: lexer.Token = parser_expect(parser,lexer.TokenKind.HASH,"'№'")
+    parser_expect(parser,lexer.TokenKind.LBRACKET,"'[' after '#'")
+    var name: lexer.Token = parser_expect(parser,lexer.TokenKind.IDENT,"atribute name after [")
+}
