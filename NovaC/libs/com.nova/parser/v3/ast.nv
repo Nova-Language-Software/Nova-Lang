@@ -52,7 +52,8 @@ public enum Declaration {
     Variable(declaration: VarDecl),
     Function(declaration: FuncDecl),
     Structure(declaration: StructDecl),
-    Enumeration(declaration: EnumDecl)
+    Enumeration(declaration: EnumDecl),
+    Attribute(declaration: Attribute)
 }
 
 public struct ImportDecl {

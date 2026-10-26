@@ -69,8 +69,6 @@ public enum TokenKind {
     COLON,
     SEMICOLON,
     DOT,
-    LINK,
-    LINK_NAME,
     DECL_ASSIGN,
     HASH
 }
@@ -118,8 +116,6 @@ var Keywords: map[string]TokenKind = map[string]TokenKind{
     "from": TokenKind.FROM,
     "extern": TokenKind.EXTERN,
     "owned": TokenKind.OWNED,
-    "link": TokenKind.LINK,
-    "link_name": TokenKind.LINK_NAME
 }
 
 var ThreeCharSymbols: map[string]TokenKind = map[string]TokenKind{

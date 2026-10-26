@@ -801,6 +801,9 @@ func parser_parse_declaration(parser: *ParserState) -> Declaration {
     if (parser_at(parser, lexer.TokenKind.ENUM)) {
         return Declaration.Enumeration{ declaration: parser_parse_enum(parser, visibility) }
     }
+    if (parser_at(parser,lexer.TokenKind.HASH)) {
+        return Declaration.Attribute { declaration: parser_parse_attribute(parser)}
+    }
     var is_extern: bool = false
     if (parser_at(parser, lexer.TokenKind.EXTERN)) {
         parser_advance(parser)
@@ -1294,8 +1297,16 @@ func parser_parse_print(parser: *ParserState) -> Stmt {
     }
 }
 
-func parser_parse_meta(parser: *ParserState) -> Attribute {
+func parser_parse_attribute(parser: *ParserState) -> Attribute {
     var start: lexer.Token = parser_expect(parser,lexer.TokenKind.HASH,"'№'")
     parser_expect(parser,lexer.TokenKind.LBRACKET,"'[' after '#'")
-    var name: lexer.Token = parser_expect(parser,lexer.TokenKind.IDENT,"atribute name after [")
+    var Attr_Name: lexer.Token = parser_expect(parser,lexer.TokenKind.IDENT,"attribute type after [")
+    parser_expect(parser,lexer.TokenKind.COLON,"':' afet attribyte type")
+    var Attr_Value: lexer.Token = parser_expect(parser,lexer.TokenKind.STRING_LIT,"attribute value after \"")
+    parser_expect(parser,lexer.TokenKind.RBRACKET,"']' after attribute value")
+    return Attribute{
+        name: Attr_Name.value
+        value: Attr_Value.value
+        span: span_between(start,parser_previous(parser))
+    }
 }

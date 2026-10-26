@@ -960,6 +960,9 @@ public func Check(program: Program) -> CheckResult {
                 sema_check_type(state, variable.type)
                 sema_declare(state, variable.name, sema_type_name(variable.type), variable.span)
             }
+            Declaration.Attribute { declaration: attribute} -> {
+                nil
+            }
         }
     }
 
@@ -1021,6 +1024,9 @@ public func Check(program: Program) -> CheckResult {
                         sema_fail(state, "variable initializer has an incompatible type", variable.span)
                     }
                 }
+            }
+                        Declaration.Attribute { declaration: attribute} -> {
+                nil
             }
         }
     }
