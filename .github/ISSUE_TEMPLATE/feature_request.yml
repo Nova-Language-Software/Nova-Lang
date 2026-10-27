@@ -1,0 +1,33 @@
+name: Feature Request
+description: Suggest a feature or improvement for Nova
+title: "[Feature]: "
+labels:
+  - enhancement
+
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What problem are you trying to solve?
+      placeholder: Describe the limitation or inconvenience.
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: Proposed solution
+      description: What would you like Nova to support?
+      placeholder: Describe your idea.
+    validations:
+      required: true
+
+  - type: textarea
+    id: example
+    attributes:
+      label: Example (optional)
+      description: Show an example of how the feature could work.
+      render: text
+    validations:
+      required: false
