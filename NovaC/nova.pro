@@ -1,1 +1,1 @@
-project_name: "nova_test_project/v1"
+project_name: "com.nova/NovaSDK"
